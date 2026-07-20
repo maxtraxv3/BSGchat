@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""E2E encrypted chat client with ASCIILINE video and G.729.1 (G.729EV) voice."""
+"""E2E encrypted chat client with ASCIILINE video and ADPCM voice."""
 
 from __future__ import annotations
 
@@ -18,7 +18,8 @@ if str(ROOT) not in sys.path:
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
 from client.audio_io import VoiceEngine, list_devices
-from client.video_io import VideoEngine, list_monitors
+from shared.adpcm import SAMPLE_RATE
+from client.video_io import VideoEngine, backend_status, list_monitors
 from shared.crypto import (
     SessionKeys,
     b64,
@@ -28,6 +29,16 @@ from shared.crypto import (
     new_ephemeral,
 )
 from shared.protocol import FrameReader, MsgType, Packet, pack_json, unpack_json
+from shared.image_share import (
+    ImageMessage,
+    load_and_convert,
+    pack_image_payload,
+    unpack_image_payload,
+    save_received_image,
+    format_image_info,
+    format_image_preview,
+    DEFAULT_QUALITY,
+)
 
 
 class ChatClient:
@@ -41,7 +52,6 @@ class ChatClient:
         voice: bool,
         video: bool,
         screen: bool,
-        bitrate: int,
         cam: int,
         monitor: int,
         ascii_w: int,
@@ -50,7 +60,10 @@ class ChatClient:
         screen_w: int,
         screen_h: int,
         screen_fps: int,
-        auto_show_screen: bool = True,
+        mode: int,
+        pixel: bool,
+        auto_show_screen: bool = False,
+        want_viewer: bool = False,
     ) -> None:
         self.host = host
         self.port = port
@@ -60,7 +73,7 @@ class ChatClient:
         self.want_voice = voice
         self.want_video = video
         self.want_screen = screen
-        self.bitrate = bitrate
+        self.want_viewer = want_viewer
         self.cam = cam
         self.monitor = monitor
         self.ascii_w = ascii_w
@@ -69,8 +82,14 @@ class ChatClient:
         self.screen_w = screen_w
         self.screen_h = screen_h
         self.screen_fps = screen_fps
+        self.mode = mode
+        self.pixel = pixel
         self.auto_show_screen = auto_show_screen
         self._last_shown_seq: dict[str, int] = {}
+        self._frame_lines: int = 0  # lines printed by last video frame (for in-place update)
+        self._received_images: dict[str, tuple[ImageMessage, bytes, str]] = {}  # id → (meta, webp, preview)
+        self._input_device: int | None = None
+        self._output_device: int | None = None
 
         self.identity_priv, self.identity_pub = generate_identity()
         self.eph_priv: X25519PrivateKey | None = None
@@ -89,6 +108,8 @@ class ChatClient:
         self.video: VideoEngine | None = None
         self._stop = asyncio.Event()
         self._print_lock = threading.Lock()
+        self.voice_active_peers: dict[str, bool] = {}
+        self.voice_is_active: bool = False
 
     # --- UI helpers ----------------------------------------------------------
 
@@ -107,20 +128,20 @@ class ChatClient:
         self.ui(f"\033[1m<{who}>\033[0m {text}")
 
     def ui_video_frame(self, text: str, label: str = "ASCIILINE") -> None:
-        # Draw remote ASCIILINE in a boxed region above the prompt area
         lines = text.splitlines()
         if not lines:
             return
-        w = max(len(l) for l in lines)
-        border = "┌" + "─" * w + "┐"
-        bottom = "└" + "─" * w + "┘"
-        body = "\n".join("│" + l.ljust(w) + "│" for l in lines)
+        n = len(lines)
         with self._print_lock:
-            sys.stdout.write(
-                f"\n\033[33m── {label} remote ({len(lines)}x{w}) ──\033[0m\n"
-                f"{border}\n{body}\n{bottom}\n"
-            )
+            # Move cursor up to overwrite previous frame if we printed one
+            if self._frame_lines > 0:
+                sys.stdout.write(f"\033[{self._frame_lines + 1}A")
+            # Header line
+            sys.stdout.write(f"\033[33m── {label} ({n} rows) ──\033[0m\033[K\n")
+            for line in lines:
+                sys.stdout.write(line + "\033[K\n")
             sys.stdout.flush()
+            self._frame_lines = n + 1  # header + frame rows
 
     # --- networking ----------------------------------------------------------
 
@@ -142,9 +163,9 @@ class ChatClient:
         )
         self.ui_sys(f"identity fingerprint: {self._fp(self.identity_pub)}")
         self.ui_sys(
-            "commands: /voice on|off  /video on|off  /screen on|off  "
-            "/monitor N  /region L T W H  /bitrate N  /peers  "
-            "/show [camera|screen]  /monitors  /devices  /quit"
+            "commands: /voice on|off|listen  /video on|off  /screen on|off  "
+            "/screen show on|off  /monitor N  /region L T W H  /peers  "
+            "/show [camera|screen]  /mic N  /speaker N  /devices  /quit"
         )
 
     async def _send(self, pkt: Packet) -> None:
@@ -247,12 +268,32 @@ class ChatClient:
         payload = json.dumps({"text": text}, separators=(",", ":")).encode()
         await self._encrypt_to_all(MsgType.CHAT, payload)
 
+    async def send_image(self, path: str) -> None:
+        if not self.sessions:
+            self.ui_status("no E2E sessions yet — wait for a peer")
+            return
+        try:
+            meta, webp_bytes, preview = load_and_convert(path)
+        except Exception as exc:
+            self.ui_status(f"image load failed: {exc}")
+            return
+        payload = pack_image_payload(meta, webp_bytes, preview)
+        if len(payload) > 1 << 20:
+            self.ui_status(f"image too large after WebP ({len(payload)} bytes)")
+            return
+        await self._encrypt_to_all(MsgType.IMAGE, payload)
+        size_kb = meta.webp_size / 1024
+        self.ui_sys(
+            f"sent image {meta.name} ({meta.width}x{meta.height}, "
+            f"WebP {size_kb:.1f} KB, id={meta.id})"
+        )
+
     # --- media hooks (called from other threads) -----------------------------
 
-    def _voice_frame_cb(self, blob: bytes) -> None:
+    def _voice_frame_cb(self, blob: bytes, track: str = "mic") -> None:
         if not self.loop or not self.sessions:
             return
-        meta = {"codec": "G729EV/open-v1", "sr": 16000, "ptime": 20}
+        meta = {"codec": "ADPCM/IMA", "sr": SAMPLE_RATE, "ptime": 20}
         asyncio.run_coroutine_threadsafe(
             self._encrypt_to_all(MsgType.VOICE, blob, meta=meta),
             self.loop,
@@ -279,25 +320,74 @@ class ChatClient:
                 screen_width=self.screen_w,
                 screen_height=self.screen_h,
                 screen_fps=self.screen_fps,
+                mode=self.mode,
+                pixel=self.pixel,
             )
         return self.video
 
-    def start_voice(self) -> None:
+    def start_voice(self, listen_only: bool = False) -> None:
         if self.voice is not None:
             return
-        self.voice = VoiceEngine(self._voice_frame_cb, bitrate_kbps=self.bitrate)
-        try:
-            self.voice.start()
-            self.ui_sys(f"voice ON — G.729.1/G.729EV open-v1 @ {self.voice.codec_tx.bitrate} kb/s")
-        except Exception as exc:
-            self.voice = None
-            self.ui_status(f"voice failed: {exc}")
+        if listen_only:
+            self.voice = VoiceEngine(
+                self._voice_frame_cb,
+                input_device=None,
+                output_device=self._output_device,
+            )
+            try:
+                self.voice.start_listen()
+                self.ui_sys("voice LISTEN — speaker output only (no mic)")
+            except Exception as exc:
+                self.voice = None
+                self.ui_status(f"voice listen failed: {exc}")
+                return
+        else:
+            self.voice = VoiceEngine(
+                self._voice_frame_cb,
+                input_device=self._input_device,
+                output_device=self._output_device,
+            )
+            try:
+                self.voice.start()
+                in_dev = self._input_device if self._input_device is not None else "default"
+                out_dev = self._output_device if self._output_device is not None else "default"
+                self.ui_sys(f"voice ON — ADPCM mic={in_dev} speaker={out_dev}")
+            except Exception as exc:
+                self.voice = None
+                self.ui_status(f"voice failed: {exc}")
+                return
+        if not self.voice:
+            return
+        self.voice_is_active = True
+        if self.loop:
+            asyncio.run_coroutine_threadsafe(
+                self._send_voice_presence(self.user_id, True), self.loop
+            )
 
     def stop_voice(self) -> None:
         if self.voice:
             self.voice.stop()
             self.voice = None
+            self.voice_is_active = False
+            if self.loop:
+                asyncio.run_coroutine_threadsafe(
+                    self._send_voice_presence(self.user_id, False), self.loop
+                )
             self.ui_sys("voice OFF")
+
+    async def _send_voice_presence(self, who: str, active: bool) -> None:
+        """Broadcast voice presence to all peers."""
+        if not self.sessions:
+            return
+        for peer_id, sess in list(self.sessions.items()):
+            plaintext = f'{{"voice_active":{str(active).lower()},"user":"{who}"}}'.encode()
+            aad = f"{self.user_id}|{peer_id}|{int(MsgType.CONTROL)}".encode()
+            ct = sess.encrypt(plaintext, aad=aad)
+            body = {"from": self.user_id, "to": peer_id, "ct": b64(ct)}
+            try:
+                await self._send(pack_json(MsgType.CONTROL, body))
+            except Exception:
+                pass
 
     def start_video(self) -> None:
         eng = self._ensure_video_engine()
@@ -335,15 +425,18 @@ class ChatClient:
             where = f"region {region.left},{region.top} {region.width}x{region.height}"
         else:
             where = f"monitor {eng.monitor}"
+        backend = eng.screen_backend_name or "?"
+        fps = eng._screen.fps if eng._screen else eng.screen_fps
         self.ui_sys(
             f"screen ON — ASCIILINE {eng.screen_width}x{eng.screen_height} "
-            f"@ {eng.screen_fps} fps ({where})"
+            f"@ {fps} fps ({where}, backend={backend})"
         )
 
     def stop_screen(self) -> None:
         if not self.video:
             return
         self.video.stop_screen()
+        self._frame_lines = 0
         self.ui_sys("screen OFF")
         if not self.video.camera_active:
             self.video = None
@@ -402,7 +495,7 @@ class ChatClient:
             self.peer_identity[src] = ident
             await self._complete_session(src, eph)
             return
-        if pkt.type in (MsgType.CHAT, MsgType.VOICE, MsgType.VIDEO):
+        if pkt.type in (MsgType.CHAT, MsgType.VOICE, MsgType.VIDEO, MsgType.IMAGE, MsgType.CONTROL):
             await self._on_encrypted(pkt)
             return
         if pkt.type == MsgType.ERROR:
@@ -437,6 +530,9 @@ class ChatClient:
                 },
             )
         )
+        # Notify new peer of our voice status
+        if self.voice_is_active:
+            await self._send_voice_presence(self.user_id, True)
 
     async def _on_encrypted(self, pkt: Packet) -> None:
         body = unpack_json(pkt.payload)
@@ -476,22 +572,47 @@ class ChatClient:
             try:
                 eng = self._ensure_video_engine()
                 src = eng.push_remote_frame(pt, source_hint=source_hint)
-                # Periodically surface screen frames so share is visible without a command
+                # Show screen frames in terminal only when Canvas viewer has never been active
                 if src == "screen" and self.auto_show_screen:
-                    meta = eng._latest_meta.get(src, {})
-                    seq = int(meta.get("seq", 0))
-                    last = self._last_shown_seq.get(src, -1)
-                    # show ~1 frame/sec to avoid flooding the terminal
-                    if seq - last >= max(1, eng.screen_fps):
-                        self._last_shown_seq[src] = seq
-                        view = eng.get_remote_view("screen")
-                        if view:
-                            who = self.peer_display.get(
-                                body.get("from", ""), body.get("from", "?")
-                            )
-                            self.ui_video_frame(view, label=f"ASCIILINE screen from {who}")
+                    from client.web_viewer import _viewer_ever_active
+                    if not _viewer_ever_active:
+                        meta = eng._latest_meta.get(src, {})
+                        seq = int(meta.get("seq", 0))
+                        last = self._last_shown_seq.get(src, -1)
+                        if seq - last >= max(1, eng.screen_fps):
+                            self._last_shown_seq[src] = seq
+                            view = eng.get_remote_view("screen")
+                            if view:
+                                who = self.peer_display.get(
+                                    body.get("from", ""), body.get("from", "?")
+                                )
+                                self.ui_video_frame(view, label=f"ASCIILINE screen from {who}")
             except Exception as exc:
                 self.ui_status(f"video decode fail: {exc}")
+        elif pkt.type == MsgType.IMAGE:
+            who = self.peer_display.get(src, src)
+            try:
+                meta, webp_bytes, preview = unpack_image_payload(pt)
+                saved_path = save_received_image(meta, webp_bytes)
+                self._received_images[meta.id] = (meta, webp_bytes, preview)
+                self.ui(format_image_info(meta, who, saved_path))
+                if preview:
+                    self.ui(format_image_preview(meta, preview, who))
+            except Exception as exc:
+                self.ui_status(f"image decode fail: {exc}")
+        elif pkt.type == MsgType.CONTROL:
+            await self._on_control_decrypted(pt, src)
+
+    async def _on_control_decrypted(self, pt: bytes, src: str):
+        try:
+            msg = json.loads(pt.decode())
+        except Exception:
+            return
+        if "voice_active" in msg:
+            self.voice_active_peers[src] = msg["voice_active"]
+            who = self.peer_display.get(src, src)
+            status = "joined voice" if msg["voice_active"] else "left voice"
+            self.ui_sys(f"{who} {status}")
 
     # --- stdin commands ------------------------------------------------------
 
@@ -523,8 +644,10 @@ class ChatClient:
                 self.start_voice()
             elif arg in ("off", "0", "stop"):
                 self.stop_voice()
+            elif arg in ("listen", "rx", "only"):
+                self.start_voice(listen_only=True)
             else:
-                self.ui_status("usage: /voice on|off")
+                self.ui_status("usage: /voice on|off|listen")
             return
         if cmd == "/video":
             if arg in ("on", "1", "start", "camera"):
@@ -536,11 +659,34 @@ class ChatClient:
             return
         if cmd in ("/screen", "/screenshare", "/share"):
             if arg in ("on", "1", "start"):
+                # Parse additional arguments: /screen on [mode] [pixel]
+                mode = int(parts[2]) if len(parts) > 2 else 5
+                pixel = parts[3].lower() not in ("off", "false", "0") if len(parts) > 3 else (mode == 5)
+
+                # 1. Store them in the correct variables
+                self.mode = mode
+                self.pixel = pixel
+
+                # 2. If the video engine is already running, update it instantly
+                if self.video:
+                    self.video.mode = self.mode
+                    self.video.pixel = self.pixel
+
                 self.start_screen()
             elif arg in ("off", "0", "stop"):
                 self.stop_screen()
+            elif parts[1].lower() == "show" if len(parts) > 1 else False:
+                sub = parts[2].lower() if len(parts) > 2 else ""
+                if sub in ("on", "1", "true"):
+                    self.auto_show_screen = True
+                    self.ui_status("terminal screen display ON")
+                elif sub in ("off", "0", "false"):
+                    self.auto_show_screen = False
+                    self.ui_status("terminal screen display OFF")
+                else:
+                    self.ui_status(f"terminal screen display: {'ON' if self.auto_show_screen else 'OFF'}")
             else:
-                self.ui_status("usage: /screen on|off")
+                self.ui_status("usage: /screen on|off [mode] [pixel]  |  /screen show on|off")
             return
         if cmd in ("/video-show", "/show"):
             which = arg if arg in ("camera", "screen", "video") else (
@@ -607,23 +753,7 @@ class ChatClient:
                     f"  [{m['index']}] {m.get('label', '?')}  "
                     f"{m['width']}x{m['height']} @ {m['left']},{m['top']}{prim}"
                 )
-            return
-        if cmd == "/bitrate":
-            if len(parts) < 2:
-                self.ui_status("usage: /bitrate <8-32>")
-                return
-            try:
-                br = int(parts[1])
-            except ValueError:
-                self.ui_status("bitrate must be integer kb/s")
-                return
-            self.bitrate = br
-            if self.voice:
-                self.voice.set_bitrate(br)
-                self.ui_sys(f"G.729EV bitrate → {self.voice.codec_tx.bitrate} kb/s "
-                            f"({self.voice.codec_tx.layers} layers)")
-            else:
-                self.ui_sys(f"bitrate set to {br} (applies when voice starts)")
+            self.ui_sys(backend_status())
             return
         if cmd == "/peers":
             if not self.peer_identity:
@@ -631,16 +761,114 @@ class ChatClient:
                 return
             for uid, pub in self.peer_identity.items():
                 ok = "E2E" if uid in self.sessions else "no-session"
-                self.ui(f"  {self.peer_display.get(uid, uid)}  {ok}  fp={self._fp(pub)}")
+                voice = " VOICE" if self.voice_active_peers.get(uid) else ""
+                self.ui(f"  {self.peer_display.get(uid, uid)}  {ok}{voice}  fp={self._fp(pub)}")
             return
         if cmd == "/devices":
             self.ui(list_devices())
             return
+        if cmd == "/viewer":
+            from client.web_viewer import start_viewer, stop_viewer
+            if arg in ("off", "0", "stop"):
+                stop_viewer()
+                self.ui_sys("canvas viewer stopped")
+            else:
+                try:
+                    port = start_viewer()
+                except Exception as exc:
+                    self.ui_status(f"viewer failed: {exc}")
+                    return
+                self.ui_sys(f"canvas viewer open at http://127.0.0.1:{port}")
+            return
+        if cmd == "/mic":
+            if arg in ("list", ""):
+                self.ui(list_devices())
+                return
+            try:
+                idx = int(arg)
+            except ValueError:
+                self.ui_status("usage: /mic <device-index>  (see /devices)")
+                return
+            self._input_device = idx
+            was_running = self.voice is not None
+            if was_running:
+                self.stop_voice()
+            if was_running:
+                self.start_voice()
+            else:
+                self.ui_sys(f"mic input set to device {idx}")
+            return
+        if cmd in ("/speaker", "/spk"):
+            if arg in ("list", ""):
+                self.ui(list_devices())
+                return
+            try:
+                idx = int(arg)
+            except ValueError:
+                self.ui_status("usage: /speaker <device-index>  (see /devices)")
+                return
+            self._output_device = idx
+            was_running = self.voice is not None
+            if was_running:
+                self.stop_voice()
+            if was_running:
+                self.start_voice()
+            else:
+                self.ui_sys(f"speaker output set to device {idx}")
+            return
+        if cmd in ("/sendimage", "/image", "/img"):
+            if len(parts) < 2:
+                self.ui_status("usage: /sendimage <path>")
+                return
+            path = " ".join(parts[1:])
+            await self.send_image(path)
+            return
+        if cmd == "/download":
+            if len(parts) < 2:
+                self.ui_status("usage: /download <image-id>  (see /images for IDs)")
+                return
+            img_id = parts[1]
+            if img_id not in self._received_images:
+                self.ui_status(f"unknown image id: {img_id}  (try /images)")
+                return
+            meta, webp_bytes, preview = self._received_images[img_id]
+            saved = save_received_image(meta, webp_bytes)
+            self.ui_sys(f"saved {meta.name} → {saved}")
+            return
+        if cmd == "/images":
+            if not self._received_images:
+                self.ui_status("no images received yet")
+                return
+            for img_id, (meta, webp, _) in self._received_images.items():
+                size_kb = meta.webp_size / 1024
+                self.ui(
+                    f"  [{img_id}] {meta.name}  {meta.width}x{meta.height}  "
+                    f"WebP {size_kb:.1f} KB"
+                )
+            self.ui_sys("use /download <id> to save, or /preview <id> to show again")
+            return
+        if cmd == "/preview":
+            if len(parts) < 2:
+                self.ui_status("usage: /preview <image-id>")
+                return
+            img_id = parts[1]
+            if img_id not in self._received_images:
+                self.ui_status(f"unknown image id: {img_id}")
+                return
+            meta, webp_bytes, preview = self._received_images[img_id]
+            if not preview:
+                self.ui_status("no preview available for this image")
+                return
+            self.ui(format_image_preview(meta, preview, "cached"))
+            return
         if cmd == "/help":
             self.ui_sys(
-                "/voice on|off  /video on|off  /screen on|off  "
+                "/voice on|off|listen  /video on|off  /screen on|off  "
                 "/monitor N  /region L T W H  /monitors  "
-                "/show [camera|screen]  /bitrate N  /peers  /devices  /quit"
+                "/viewer [off]  "
+                "/show [camera|screen]  /peers  /devices  "
+                "/mic N  /speaker N  "
+                "/sendimage <path>  /images  /download <id>  /preview <id>  /quit"
             )
             return
         self.ui_status(f"unknown command {cmd} — try /help")
@@ -651,6 +879,13 @@ class ChatClient:
             self.start_voice()
         if self.want_video:
             self.start_video()
+        if self.want_viewer:
+            from client.web_viewer import start_viewer
+            try:
+                port = start_viewer()
+                self.ui_sys(f"canvas viewer open at http://127.0.0.1:{port}")
+            except Exception as exc:
+                self.ui_status(f"viewer failed: {exc}")
         if self.want_screen:
             self.start_screen()
         recv_task = asyncio.create_task(self.recv_loop())
@@ -672,7 +907,7 @@ class ChatClient:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="E2E chat — ASCIILINE camera/screen + G.729.1/G.729EV voice"
+        description="E2E chat -- ASCIILINE camera/screen + ADPCM voice"
     )
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=9473)
@@ -682,15 +917,18 @@ def main() -> None:
     ap.add_argument("--voice", action="store_true", help="start voice on connect")
     ap.add_argument("--video", action="store_true", help="start ASCIILINE camera on connect")
     ap.add_argument("--screen", action="store_true", help="start ASCIILINE screen share on connect")
-    ap.add_argument("--bitrate", type=int, default=24, help="G.729EV kb/s (8-32)")
+    ap.add_argument("--viewer", action="store_true", help="open Canvas viewer in browser on connect")
     ap.add_argument("--camera", type=int, default=0)
     ap.add_argument("--monitor", type=int, default=1, help="mss monitor index (1=primary usually)")
-    ap.add_argument("--ascii-w", type=int, default=80, help="camera ASCII width")
-    ap.add_argument("--ascii-h", type=int, default=28, help="camera ASCII height")
-    ap.add_argument("--ascii-fps", type=int, default=6, help="camera ASCII fps")
+    ap.add_argument("--ascii-w", type=int, default=120, help="camera ASCII width")
+    ap.add_argument("--ascii-h", type=int, default=40, help="camera ASCII height")
+    ap.add_argument("--ascii-fps", type=int, default=30, help="camera ASCII fps")
     ap.add_argument("--screen-w", type=int, default=120, help="screen share ASCII width")
     ap.add_argument("--screen-h", type=int, default=40, help="screen share ASCII height")
-    ap.add_argument("--screen-fps", type=int, default=4, help="screen share ASCII fps")
+    ap.add_argument("--screen-fps", type=int, default=30, help="screen share ASCII fps")
+    ap.add_argument("--mode", type=int, default=5, help="Rendering mode (1-5)")
+    ap.add_argument("--no-pixel", dest="pixel", action="store_false", help="Disable PIXEL mode (on by default)")
+    ap.set_defaults(pixel=True)
     args = ap.parse_args()
 
     user = args.user or f"user-{os.getpid()}"
@@ -705,7 +943,6 @@ def main() -> None:
         voice=args.voice,
         video=args.video,
         screen=args.screen,
-        bitrate=args.bitrate,
         cam=args.camera,
         monitor=args.monitor,
         ascii_w=args.ascii_w,
@@ -714,6 +951,9 @@ def main() -> None:
         screen_w=args.screen_w,
         screen_h=args.screen_h,
         screen_fps=args.screen_fps,
+        mode=args.mode,
+        pixel=args.pixel,
+        want_viewer=args.viewer,
     )
     try:
         asyncio.run(client.run())

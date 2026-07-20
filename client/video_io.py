@@ -2,17 +2,22 @@
 
 Sources (camera / screen) are independent tracks. Both can run at once; each
 frame is tagged so receivers can display them separately.
+
+Screen share uses :mod:`client.screencap` which auto-selects a working backend
+(grim / spectacle / mss / ImageMagick) — needed because mss is black on many
+Wayland compositors (including KDE kwin_wayland).
 """
 
 from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
 from typing import Callable, Literal
 
 import numpy as np
 
+from client.screencap import Region as CapRegion
+from client.screencap import ScreenGrabber, backend_status, list_monitors
 from shared.asciline import (
     FLAG_CAMERA,
     FLAG_REGION,
@@ -23,15 +28,12 @@ from shared.asciline import (
 
 SourceName = Literal["camera", "screen"]
 
+# re-export for client.main
+__all__ = ["VideoEngine", "CaptureRegion", "list_monitors", "backend_status"]
 
-@dataclass
-class CaptureRegion:
-    """Pixel region in global desktop coordinates (mss style)."""
 
-    left: int
-    top: int
-    width: int
-    height: int
+class CaptureRegion(CapRegion):
+    """Pixel region in global desktop coordinates."""
 
     def as_mss(self) -> dict[str, int]:
         return {
@@ -40,23 +42,6 @@ class CaptureRegion:
             "width": self.width,
             "height": self.height,
         }
-
-
-def list_monitors() -> list[dict]:
-    """Return mss monitor list (index 0 = virtual all-monitors desktop)."""
-    from mss import MSS
-
-    with MSS() as sct:
-        out = []
-        for i, m in enumerate(sct.monitors):
-            item = {"index": i, **{k: m[k] for k in ("left", "top", "width", "height") if k in m}}
-            if i == 0:
-                item["label"] = "all"
-            else:
-                item["label"] = m.get("output") or f"monitor-{i}"
-                item["primary"] = bool(m.get("is_primary"))
-            out.append(item)
-        return out
 
 
 class _Track:
@@ -71,6 +56,7 @@ class _Track:
     ) -> None:
         self.name = name
         self.on_frame = on_frame
+        # The encoder only accepts flags. We do not pass mode/pixel kwargs here.
         self.encoder = AsciiLineEncoder(width=width, height=height, fps=fps, flags=flags)
         self.fps = fps
         self._running = False
@@ -79,7 +65,7 @@ class _Track:
     def stop(self) -> None:
         self._running = False
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2.0)
+            self._thread.join(timeout=3.0)
         self._thread = None
 
 
@@ -98,6 +84,9 @@ class VideoEngine:
         screen_width: int | None = None,
         screen_height: int | None = None,
         screen_fps: int | None = None,
+        screen_backend: str | None = None,
+        mode: int = 5,
+        pixel: bool = True,
     ) -> None:
         self.on_frame = on_frame
         self.width = width
@@ -106,24 +95,28 @@ class VideoEngine:
         self.camera_index = camera_index
         self.monitor = monitor
         self.region = region
-        # Screen often benefits from a wider canvas for UI text
         self.screen_width = screen_width or max(width, 120)
         self.screen_height = screen_height or max(height, 40)
-        self.screen_fps = screen_fps or min(fps, 5)
+        self.screen_fps = screen_fps if screen_fps is not None else 30
+        self.screen_backend_pref = screen_backend
+
+        # Store global runtime preferences
+        self.mode = mode
+        self.pixel = pixel
 
         self.decoder = AsciiLineDecoder()
-        self._latest_remote: dict[str, str] = {}  # source → ascii text
+        self._latest_remote: dict[str, str] = {}
         self._latest_meta: dict[str, dict] = {}
         self._lock = threading.Lock()
         self._camera: _Track | None = None
         self._screen: _Track | None = None
         self._cap = None
-        self._sct = None
+        self.grabber: ScreenGrabber | None = None
+        self.screen_backend_name: str | None = None
 
     # --- remote cache --------------------------------------------------------
 
     def push_remote_frame(self, blob: bytes, source_hint: str | None = None) -> str:
-        """Decode and cache; return resolved source name."""
         fr = self.decoder.decode(blob)
         if source_hint:
             src = source_hint
@@ -133,6 +126,17 @@ class VideoEngine:
             src = "camera"
         else:
             src = "video"
+
+        # Push embedded JPEG to Canvas viewer for screen frames (avoid decode+re-encode)
+        if fr.img_b64 and src == "screen":
+            import base64
+            from client.web_viewer import push_viewer_frame_jpeg
+            try:
+                jpg_bytes = base64.b64decode(fr.img_b64)
+                push_viewer_frame_jpeg(jpg_bytes)
+            except Exception:
+                pass
+
         with self._lock:
             self._latest_remote[src] = fr.render()
             self._latest_meta[src] = {
@@ -147,7 +151,6 @@ class VideoEngine:
         with self._lock:
             if source in self._latest_remote:
                 return self._latest_remote[source]
-            # fall back to any available
             if self._latest_remote:
                 return next(iter(self._latest_remote.values()))
             return ""
@@ -158,14 +161,21 @@ class VideoEngine:
 
     # --- camera --------------------------------------------------------------
 
-    def start_camera(self) -> None:
+    def start_camera(self, mode: int | None = None, pixel: bool | None = None) -> None:
         if self._camera is not None:
             return
+
+        m = mode if mode is not None else self.mode
+        p = pixel if pixel is not None else self.pixel
+
         import cv2
 
         self._cap = cv2.VideoCapture(self.camera_index)
         if not self._cap.isOpened():
             self._cap = None
+
+        # Pack mode and pixel settings into the bitwise flags array
+        flags = FLAG_CAMERA | (m << 8) | (1 if p else 0)
 
         track = _Track(
             "camera",
@@ -173,7 +183,7 @@ class VideoEngine:
             self.width,
             self.height,
             self.fps,
-            FLAG_CAMERA,
+            flags,
         )
         track._running = True
         track._thread = threading.Thread(
@@ -219,16 +229,30 @@ class VideoEngine:
 
     # --- screen share --------------------------------------------------------
 
-    def start_screen(self) -> None:
+    def start_screen(self, mode: int | None = None, pixel: bool | None = None) -> None:
         if self._screen is not None:
             return
+
+        m = mode if mode is not None else self.mode
+        p = pixel if pixel is not None else self.pixel
+
+        grabber = ScreenGrabber(preferred=self.screen_backend_pref)
+        name = grabber.probe(monitor=self.monitor)
+        self.grabber = grabber
+        self.screen_backend_name = name
+
+        fps = min(self.screen_fps, grabber.max_fps)
+
+        # Pack mode and pixel settings into the bitwise flags array
         flags = FLAG_SCREEN | (FLAG_REGION if self.region is not None else 0)
+        flags |= (m << 8) | (1 if p else 0)
+
         track = _Track(
             "screen",
             lambda b: self.on_frame(b, "screen"),
             self.screen_width,
             self.screen_height,
-            self.screen_fps,
+            fps,
             flags,
         )
         track._running = True
@@ -239,50 +263,67 @@ class VideoEngine:
         track._thread.start()
 
     def _screen_loop(self, track: _Track) -> None:
-        from mss import MSS
+        import base64
+        import cv2
+
+        from client.web_viewer import push_viewer_frame_jpeg
 
         period = 1.0 / max(track.fps, 1)
-        with MSS() as sct:
+        assert self.grabber is not None
+
+        # Start streaming capture so frames are always ready (avoids blocking on slow backends)
+        if self.mode == 5:
+            self.grabber.start_streaming(
+                monitor=self.monitor, region=self.region, color=True
+            )
+        else:
+            self.grabber.start_streaming(
+                monitor=self.monitor, region=self.region, color=False
+            )
+
+        try:
             while track._running:
                 start = time.time()
                 try:
-                    frame = self._grab_screen(sct)
-                    blob = track.encoder.encode_gray(frame)
+                    frame = self.grabber.get_latest()
+                    if frame is None:
+                        time.sleep(0.01)
+                        continue
+
+                    if self.mode == 5:
+                        # frame is BGR from streaming capture
+                        thumb = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_AREA)
+                        ok, jpg_buf = cv2.imencode(".jpg", thumb, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                        if ok:
+                            jpg_bytes = jpg_buf.tobytes()
+                            push_viewer_frame_jpeg(jpg_bytes)
+                            img_b64 = base64.b64encode(jpg_bytes).decode()
+                        else:
+                            img_b64 = ""
+                        blob = track.encoder.encode_color(frame, use_blocks=self.pixel, img_b64=img_b64)
+                    else:
+                        if frame.ndim == 3:
+                            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.shape[2] >= 3 else frame[:, :, 0]
+                        blob = track.encoder.encode_gray(frame)
+
                     track.on_frame(blob)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    import sys
+                    print(f"[screen] capture error: {exc}", file=sys.stderr, flush=True)
                 elapsed = time.time() - start
                 time.sleep(max(0.0, period - elapsed))
-
-    def _grab_screen(self, sct) -> np.ndarray:
-        if self.region is not None:
-            shot = sct.grab(self.region.as_mss())
-        else:
-            monitors = sct.monitors
-            idx = self.monitor
-            if idx < 0 or idx >= len(monitors):
-                idx = 1 if len(monitors) > 1 else 0
-            shot = sct.grab(monitors[idx])
-        # mss returns BGRA
-        bgra = np.array(shot, dtype=np.uint8)
-        if bgra.ndim == 3 and bgra.shape[2] >= 3:
-            # ITU-R BT.601 luma from BGR
-            b = bgra[:, :, 0].astype(np.float32)
-            g = bgra[:, :, 1].astype(np.float32)
-            r = bgra[:, :, 2].astype(np.float32)
-            gray = (0.114 * b + 0.587 * g + 0.299 * r).astype(np.uint8)
-        else:
-            gray = bgra.astype(np.uint8)
-        return gray
+        finally:
+            self.grabber.stop_streaming()
 
     def stop_screen(self) -> None:
         if self._screen:
             self._screen.stop()
             self._screen = None
+        self.grabber = None
 
     def set_monitor(self, index: int) -> None:
         self.monitor = index
-        self.region = None  # full monitor mode
+        self.region = None
 
     def set_region(self, left: int, top: int, width: int, height: int) -> None:
         if width < 8 or height < 8:

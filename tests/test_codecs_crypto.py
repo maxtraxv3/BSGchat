@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke tests for crypto, G.729EV, ASCIILINE, and framing."""
+"""Smoke tests for crypto, ADPCM, ASCIILINE, and framing."""
 
 from __future__ import annotations
 
@@ -11,16 +11,9 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from shared.adpcm import ADPCMCodec, ADPCMFrame, FRAME_SAMPLES as ADPCM_FRAME_SAMPLES, WIRE_TAG
 from shared.asciline import AsciiLineDecoder, AsciiLineEncoder, AsciiLineFrame
 from shared.crypto import derive_session, generate_identity, new_ephemeral
-from shared.g729ev import (
-    FRAME_SAMPLES,
-    LAYER_RATES_KBPS,
-    G729EVCodec,
-    G729EVFrame,
-    layers_to_bytes,
-    rate_to_layers,
-)
 from shared.protocol import FrameReader, MsgType, Packet, pack_json
 
 
@@ -59,24 +52,67 @@ def test_e2e_crypto() -> None:
     print("OK e2e_crypto")
 
 
-def test_g729ev_roundtrip() -> None:
-    for kbps in LAYER_RATES_KBPS:
-        enc = G729EVCodec(kbps)
-        dec = G729EVCodec(kbps)
-        # 440 Hz tone
-        t = np.arange(FRAME_SAMPLES) / 16000.0
-        pcm = (0.4 * np.sin(2 * np.pi * 440 * t) * 32767).astype(np.int16)
-        blob = enc.encode(pcm)
-        fr = G729EVFrame.unpack(blob)
-        assert fr.layers == rate_to_layers(kbps)
-        assert len(fr.data) == layers_to_bytes(fr.layers)
-        out = dec.decode(blob)
-        assert out.dtype == np.int16
-        assert len(out) == FRAME_SAMPLES
-        # should not be pure silence for a tone at higher rates
-        if kbps >= 14:
-            assert float(np.max(np.abs(out))) > 100
-    print("OK g729ev_roundtrip")
+def test_adpcm_roundtrip() -> None:
+    enc = ADPCMCodec(dtx=False)
+    dec = ADPCMCodec(dtx=False)
+
+    # 440 Hz tone at 8 kHz
+    t = np.arange(ADPCM_FRAME_SAMPLES) / 8000.0
+    pcm = (0.4 * np.sin(2 * np.pi * 440 * t) * 32767).astype(np.int16)
+
+    blob = enc.encode(pcm)
+    assert blob is not None
+    fr = ADPCMFrame.unpack(blob)
+    assert not fr.dtx
+    assert len(fr.data) == 80  # BYTES_PER_FRAME
+    assert WIRE_TAG == "ADPCM/ima-v1"
+
+    out = dec.decode(blob)
+    assert out.dtype == np.int16
+    assert len(out) == ADPCM_FRAME_SAMPLES
+    # decoded should track the original tone
+    assert float(np.max(np.abs(out))) > 100
+    print("OK adpcm_roundtrip")
+
+
+def test_adpcm_dtx() -> None:
+    enc = ADPCMCodec(dtx=True)
+    dec = ADPCMCodec(dtx=False)
+
+    # silence → DTX should suppress frames
+    silent = np.zeros(ADPCM_FRAME_SAMPLES, dtype=np.int16)
+    blob1 = enc.encode(silent)
+    assert blob1 is not None  # first silent frame sends SID
+    fr1 = ADPCMFrame.unpack(blob1)
+    assert fr1.dtx
+
+    blob2 = enc.encode(silent)
+    assert blob2 is None  # subsequent silence → suppressed
+
+    # SID frame decodes to zeros without crashing
+    out = dec.decode(blob1)
+    assert len(out) == ADPCM_FRAME_SAMPLES
+    assert float(np.max(np.abs(out))) == 0.0
+    print("OK adpcm_dtx")
+
+
+def test_adpcm_short_long_frames() -> None:
+    codec = ADPCMCodec(dtx=False)
+
+    # short frame (padding)
+    short = np.array([1000, -1000], dtype=np.int16)
+    blob = codec.encode(short)
+    assert blob is not None
+    out = codec.decode(blob)
+    assert len(out) == ADPCM_FRAME_SAMPLES
+
+    # long frame (truncation)
+    long = np.tile(np.array([500, -500], dtype=np.int16), ADPCM_FRAME_SAMPLES)
+    blob = codec.encode(long)
+    assert blob is not None
+    out = codec.decode(blob)
+    assert len(out) == ADPCM_FRAME_SAMPLES
+    print("OK adpcm_short_long_frames")
 
 
 def test_asciline_roundtrip() -> None:
@@ -105,6 +141,8 @@ def test_asciline_roundtrip() -> None:
 if __name__ == "__main__":
     test_frame_reader()
     test_e2e_crypto()
-    test_g729ev_roundtrip()
+    test_adpcm_roundtrip()
+    test_adpcm_dtx()
+    test_adpcm_short_long_frames()
     test_asciline_roundtrip()
     print("\nAll smoke tests passed.")

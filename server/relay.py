@@ -82,6 +82,7 @@ class Relay:
             MsgType.CHAT,
             MsgType.VOICE,
             MsgType.VIDEO,
+            MsgType.IMAGE,
             MsgType.CONTROL,
         ):
             await self._broadcast(peer, pkt)

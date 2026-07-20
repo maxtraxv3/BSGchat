@@ -53,14 +53,18 @@ class AsciiLineFrame:
     flags: int
     rows: list[str]
     source: str = "video"
+    img_b64: str = ""  # optional base64 JPEG for Canvas viewer
 
     def encode(self) -> bytes:
         header = (
             f"ASCIILINE/1.0\n"
             f"W:{self.width} H:{self.height} FPS:{self.fps} "
             f"SEQ:{self.seq} TS:{self.timestamp_ms} FLAGS:{self.flags:x} "
-            f"SRC:{self.source}\n"
+            f"SRC:{self.source}"
         )
+        if self.img_b64:
+            header += f" IMG:{self.img_b64}"
+        header += "\n"
         body = "\n".join(self.rows)
         return (header + body + "\n.\n").encode("utf-8")
 
@@ -84,6 +88,7 @@ class AsciiLineFrame:
         ts = int(meta.get("TS", "0"))
         flags = int(meta.get("FLAGS", "0"), 16)
         source = meta.get("SRC") or source_from_flags(flags)
+        img_b64 = meta.get("IMG", "")
 
         rows: list[str] = []
         for line in lines[2:]:
@@ -94,7 +99,7 @@ class AsciiLineFrame:
             rows.extend([" " * width] * (height - len(rows)))
         elif height and len(rows) > height:
             rows = rows[:height]
-        return cls(width, height, fps, seq, ts, flags, rows, source=source)
+        return cls(width, height, fps, seq, ts, flags, rows, source=source, img_b64=img_b64)
 
     def render(self) -> str:
         return "\n".join(self.rows)
@@ -136,14 +141,15 @@ class AsciiLineEncoder:
             g = gray
         if g.ndim == 3:
             g = cv2.cvtColor(g, cv2.COLOR_BGR2GRAY)
-        # AREA downsample preserves more UI detail for screen share
         interp = cv2.INTER_AREA
         resized = cv2.resize(g, (self.width, self.height), interpolation=interp)
-        # optional contrast stretch
+        # Contrast stretch with percentile clipping
         lo, hi = np.percentile(resized, [2, 98] if (self.flags & FLAG_SCREEN) else [5, 95])
         if hi <= lo:
             hi = lo + 1
         norm = np.clip((resized.astype(np.float32) - lo) / (hi - lo), 0, 1)
+        # Gamma correction (0.45) brightens midtones for better ASCII contrast
+        norm = np.power(norm, 0.45)
         idx = (norm * (len(self.ramp) - 1)).astype(np.int32)
         chars = self.ramp[idx]
         rows = ["".join(row.tolist()) for row in chars]
@@ -156,6 +162,93 @@ class AsciiLineEncoder:
             flags=self.flags,
             rows=rows,
             source=self.source,
+        )
+        self._seq = (self._seq + 1) & 0xFFFFFFFF
+        return fr.encode()
+
+    def encode_color(self, frame: np.ndarray, use_blocks: bool = False, img_b64: str = "") -> bytes:
+        """frame: HxWxC uint8 image (BGR from OpenCV).
+
+        When use_blocks=True, uses half-block characters (▀) with ANSI
+        foreground+background colors to pack 2 vertical pixels per cell,
+        effectively doubling vertical resolution for a pixel-art look.
+        """
+        import cv2
+
+        # Ensure we have a 3-channel color image
+        if frame.ndim == 2:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+            gray = frame
+        else:
+            # OpenCV captures in BGR, so we must convert to RGB for terminal output
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        interp = cv2.INTER_AREA
+
+        if use_blocks:
+            # Double vertical resolution: 2 source rows → 1 output row via ▀
+            virt_h = self.height * 2
+            resized_rgb = cv2.resize(rgb, (self.width, virt_h), interpolation=interp)
+            resized_gray = cv2.resize(gray, (self.width, virt_h), interpolation=interp)
+        else:
+            resized_rgb = cv2.resize(rgb, (self.width, self.height), interpolation=interp)
+            resized_gray = cv2.resize(gray, (self.width, self.height), interpolation=interp)
+
+        # Contrast stretch
+        lo, hi = np.percentile(resized_gray, [2, 98] if (self.flags & FLAG_SCREEN) else [5, 95])
+        if hi <= lo:
+            hi = lo + 1
+        norm = np.clip((resized_gray.astype(np.float32) - lo) / (hi - lo), 0, 1)
+        # Gamma correction brightens midtones for better visual contrast
+        norm = np.power(norm, 0.45)
+        idx = (norm * (len(self.ramp) - 1)).astype(np.int32)
+        chars = self.ramp[idx]
+
+        # Also apply gamma to the RGB data so colors match the brighter mapping
+        color_norm = np.clip((resized_gray.astype(np.float32) - lo) / (hi - lo), 0, 1)
+        color_gamma = np.power(color_norm, 0.45)
+        # Brighten RGB proportionally to the gamma correction
+        ratio = np.where(color_norm > 0, color_gamma / np.maximum(color_norm, 1e-6), 1.0)
+        ratio = np.clip(ratio, 0.8, 1.4)  # conservative boost to avoid clipping
+        resized_rgb = np.clip(resized_rgb.astype(np.float32) * ratio[:,:,np.newaxis], 0, 255).astype(np.uint8)
+
+        rows = []
+        if use_blocks:
+            # Half-block mode: pack 2 vertical pixels into one ▀ character
+            # Top pixel → foreground, bottom pixel → background
+            for y in range(0, virt_h, 2):
+                row_str = []
+                for x in range(self.width):
+                    r1, g1, b1 = resized_rgb[y, x]
+                    r2, g2, b2 = resized_rgb[y + 1, x] if y + 1 < virt_h else (0, 0, 0)
+                    # ▀ with fg=top pixel, bg=bottom pixel
+                    row_str.append(
+                        f"\033[38;2;{r1};{g1};{b1};48;2;{r2};{g2};{b2}m▀"
+                    )
+                row_str.append("\033[0m")
+                rows.append("".join(row_str))
+        else:
+            # Standard ASCII ramp mode
+            for y in range(self.height):
+                row_str = []
+                for x in range(self.width):
+                    r, g, b = resized_rgb[y, x]
+                    char = chars[y, x]
+                    row_str.append(f"\x1b[38;2;{r};{g};{b}m{char}")
+                row_str.append("\x1b[0m")
+                rows.append("".join(row_str))
+
+        fr = AsciiLineFrame(
+            width=self.width,
+            height=self.height,
+            fps=self.fps,
+            seq=self._seq,
+            timestamp_ms=int(time.time() * 1000) & 0xFFFFFFFF,
+            flags=self.flags,
+            rows=rows,
+            source=self.source,
+            img_b64=img_b64,
         )
         self._seq = (self._seq + 1) & 0xFFFFFFFF
         return fr.encode()

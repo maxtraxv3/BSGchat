@@ -22,6 +22,7 @@ class MsgType(IntEnum):
     CHAT = 0x20
     VOICE = 0x30
     VIDEO = 0x40
+    IMAGE = 0x45
     CONTROL = 0x50
     ERROR = 0x7F
 
