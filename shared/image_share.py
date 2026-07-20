@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import struct
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,10 +50,14 @@ _PREVIEW_RAMP = list(" .:-=+*#%@")
 
 def _get_save_dir() -> Path:
     """Return the directory for saving received images."""
-    base = os.environ.get("XDG_DATA_HOME", "")
-    if not base:
-        base = os.path.join(Path.home(), ".local", "share")
-    d = Path(base) / "asciline" / "images"
+    if sys.platform == "win32":
+        base = os.path.join(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"), "asciline")
+    else:
+        base = os.environ.get("XDG_DATA_HOME", "")
+        if not base:
+            base = os.path.join(Path.home(), ".local", "share")
+        base = os.path.join(base, "asciline")
+    d = Path(base) / "images"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

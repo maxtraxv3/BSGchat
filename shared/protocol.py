@@ -23,6 +23,7 @@ class MsgType(IntEnum):
     VOICE = 0x30
     VIDEO = 0x40
     IMAGE = 0x45
+    FILE = 0x46
     CONTROL = 0x50
     ERROR = 0x7F
 

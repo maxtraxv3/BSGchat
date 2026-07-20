@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import mimetypes
 import os
+import queue
 import sys
 import threading
 from pathlib import Path
@@ -39,6 +41,35 @@ from shared.image_share import (
     format_image_preview,
     DEFAULT_QUALITY,
 )
+from shared.file_share import (
+    FileMessage,
+    make_file_id,
+    pack_file_payload,
+    unpack_file_payload,
+    save_received_file,
+    format_file_info,
+    MAX_FILE_SIZE,
+)
+
+
+def _enable_windows_vt() -> None:
+    """Enable VT100 escape code processing on Windows console."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        STD_OUTPUT_HANDLE = -11
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        mode = ctypes.c_ulong()
+        kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+        kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+    except Exception:
+        pass  # best-effort; works on Windows Terminal without this
+
+
+_enable_windows_vt()
 
 
 class ChatClient:
@@ -64,6 +95,7 @@ class ChatClient:
         pixel: bool,
         auto_show_screen: bool = False,
         want_viewer: bool = False,
+        tor_proxy: str = "",
     ) -> None:
         self.host = host
         self.port = port
@@ -85,9 +117,11 @@ class ChatClient:
         self.mode = mode
         self.pixel = pixel
         self.auto_show_screen = auto_show_screen
+        self.tor_proxy = tor_proxy
         self._last_shown_seq: dict[str, int] = {}
         self._frame_lines: int = 0  # lines printed by last video frame (for in-place update)
         self._received_images: dict[str, tuple[ImageMessage, bytes, str]] = {}  # id → (meta, webp, preview)
+        self._received_files: dict[str, tuple[FileMessage, bytes]] = {}  # id → (meta, file_bytes)
         self._input_device: int | None = None
         self._output_device: int | None = None
 
@@ -110,22 +144,51 @@ class ChatClient:
         self._print_lock = threading.Lock()
         self.voice_active_peers: dict[str, bool] = {}
         self.voice_is_active: bool = False
+        self._gui_queue: queue.Queue | None = None  # set by GUI
+        self._gui_mode: bool = False
 
     # --- UI helpers ----------------------------------------------------------
 
     def ui(self, msg: str) -> None:
+        if self._gui_queue is not None:
+            self._gui_queue.put(("ui", (msg,), {}))
+            return
         with self._print_lock:
             sys.stdout.write(msg + "\n")
             sys.stdout.flush()
 
     def ui_status(self, msg: str) -> None:
+        if self._gui_queue is not None:
+            self._gui_queue.put(("ui_status", (msg,), {}))
+            return
         self.ui(f"\033[90m* {msg}\033[0m")
 
     def ui_sys(self, msg: str) -> None:
+        if self._gui_queue is not None:
+            self._gui_queue.put(("ui_sys", (msg,), {}))
+            return
         self.ui(f"\033[36m* {msg}\033[0m")
 
     def ui_chat(self, who: str, text: str) -> None:
+        if self._gui_queue is not None:
+            self._gui_queue.put(("ui_chat", (who, text), {}))
+            return
         self.ui(f"\033[1m<{who}>\033[0m {text}")
+
+    def ui_video_jpeg(self, jpeg_bytes: bytes, source: str) -> None:
+        """Push a raw JPEG frame to the GUI (if active)."""
+        if self._gui_queue is not None:
+            self._gui_queue.put(("ui_video_jpeg", (jpeg_bytes, source), {}))
+
+    def ui_image(self, image_id: str, webp_bytes: bytes, sender: str, name: str, width: int, height: int) -> None:
+        """Push a received image to the GUI for pixel display."""
+        if self._gui_queue is not None:
+            self._gui_queue.put(("ui_image", (image_id, webp_bytes, sender, name, width, height), {}))
+
+    def ui_file(self, file_id: str, file_bytes: bytes, sender: str, name: str, mime_type: str, size: int) -> None:
+        """Push a received file to the GUI for display."""
+        if self._gui_queue is not None:
+            self._gui_queue.put(("ui_file", (file_id, file_bytes, sender, name, mime_type, size), {}))
 
     def ui_video_frame(self, text: str, label: str = "ASCIILINE") -> None:
         lines = text.splitlines()
@@ -147,7 +210,17 @@ class ChatClient:
 
     async def connect(self) -> None:
         self.loop = asyncio.get_running_loop()
-        self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
+        if self.tor_proxy:
+            try:
+                from python_socks.async_.asyncio import Proxy
+            except ImportError:
+                self.ui_status("python-socks not installed. Run: pip install python-socks[asyncio]")
+                raise SystemExit(1)
+            proxy = Proxy.from_url(self.tor_proxy)
+            sock = await proxy.connect(dest_host=self.host, dest_port=self.port)
+            self.reader, self.writer = await asyncio.open_connection(sock=sock)
+        else:
+            self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
         hello = pack_json(
             MsgType.HELLO,
             {
@@ -160,12 +233,14 @@ class ChatClient:
         await self._send(hello)
         self.ui_sys(
             f"connected to {self.host}:{self.port} room={self.room!r} as {self.user_id}"
+            + (" (via Tor)" if self.tor_proxy else "")
         )
         self.ui_sys(f"identity fingerprint: {self._fp(self.identity_pub)}")
         self.ui_sys(
             "commands: /voice on|off|listen  /video on|off  /screen on|off  "
-            "/screen show on|off  /monitor N  /region L T W H  /peers  "
-            "/show [camera|screen]  /mic N  /speaker N  /devices  /quit"
+            "/screen show on|off  /monitor N  /monitors  /region L T W H  "
+            "/peers  /show [camera|screen]  /mic N  /speaker N  /devices  "
+            "/viewer [off]  /sendimage <path>  /sendfile <path>  /images  /files  /download <id>  /help  /quit"
         )
 
     async def _send(self, pkt: Packet) -> None:
@@ -267,6 +342,7 @@ class ChatClient:
             return
         payload = json.dumps({"text": text}, separators=(",", ":")).encode()
         await self._encrypt_to_all(MsgType.CHAT, payload)
+        self.ui_chat(self.display, text)
 
     async def send_image(self, path: str) -> None:
         if not self.sessions:
@@ -286,6 +362,35 @@ class ChatClient:
         self.ui_sys(
             f"sent image {meta.name} ({meta.width}x{meta.height}, "
             f"WebP {size_kb:.1f} KB, id={meta.id})"
+        )
+
+    async def send_file(self, path: str) -> None:
+        if not self.sessions:
+            self.ui_status("no E2E sessions yet — wait for a peer")
+            return
+        import hashlib as _hl
+        from pathlib import Path as _P
+        p = _P(path)
+        if not p.is_file():
+            self.ui_status(f"file not found: {path}")
+            return
+        file_bytes = p.read_bytes()
+        if len(file_bytes) > MAX_FILE_SIZE:
+            self.ui_status(f"file too large ({len(file_bytes)} bytes, max {MAX_FILE_SIZE})")
+            return
+        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        meta = FileMessage(
+            id=make_file_id(file_bytes),
+            name=p.name,
+            mime_type=mime,
+            size=len(file_bytes),
+            sha256=_hl.sha256(file_bytes).hexdigest(),
+        )
+        payload = pack_file_payload(meta, file_bytes)
+        await self._encrypt_to_all(MsgType.FILE, payload)
+        size_kb = len(file_bytes) / 1024
+        self.ui_sys(
+            f"sent file {meta.name} ({mime}, {size_kb:.1f} KB, id={meta.id})"
         )
 
     # --- media hooks (called from other threads) -----------------------------
@@ -389,6 +494,20 @@ class ChatClient:
             except Exception:
                 pass
 
+    async def _send_media_presence(self, who: str, media_type: str, active: bool) -> None:
+        """Broadcast screen/camera presence to all peers."""
+        if not self.sessions:
+            return
+        for peer_id, sess in list(self.sessions.items()):
+            plaintext = f'{{"media_type":"{media_type}","media_active":{str(active).lower()},"user":"{who}"}}'.encode()
+            aad = f"{self.user_id}|{peer_id}|{int(MsgType.CONTROL)}".encode()
+            ct = sess.encrypt(plaintext, aad=aad)
+            body = {"from": self.user_id, "to": peer_id, "ct": b64(ct)}
+            try:
+                await self._send(pack_json(MsgType.CONTROL, body))
+            except Exception:
+                pass
+
     def start_video(self) -> None:
         eng = self._ensure_video_engine()
         if eng.camera_active:
@@ -399,6 +518,10 @@ class ChatClient:
             f"camera ON — ASCIILINE {self.ascii_w}x{self.ascii_h} "
             f"@ {self.ascii_fps} fps ({note})"
         )
+        if self.loop:
+            asyncio.run_coroutine_threadsafe(
+                self._send_media_presence(self.user_id, "camera", True), self.loop
+            )
 
     def stop_video(self) -> None:
         if not self.video:
@@ -407,6 +530,10 @@ class ChatClient:
         self.ui_sys("camera OFF")
         if not self.video.screen_active:
             self.video = None
+        if self.loop:
+            asyncio.run_coroutine_threadsafe(
+                self._send_media_presence(self.user_id, "camera", False), self.loop
+            )
 
     def start_screen(self) -> None:
         eng = self._ensure_video_engine()
@@ -431,6 +558,10 @@ class ChatClient:
             f"screen ON — ASCIILINE {eng.screen_width}x{eng.screen_height} "
             f"@ {fps} fps ({where}, backend={backend})"
         )
+        if self.loop:
+            asyncio.run_coroutine_threadsafe(
+                self._send_media_presence(self.user_id, "screen", True), self.loop
+            )
 
     def stop_screen(self) -> None:
         if not self.video:
@@ -440,6 +571,10 @@ class ChatClient:
         self.ui_sys("screen OFF")
         if not self.video.camera_active:
             self.video = None
+        if self.loop:
+            asyncio.run_coroutine_threadsafe(
+                self._send_media_presence(self.user_id, "screen", False), self.loop
+            )
 
     # --- receive path --------------------------------------------------------
 
@@ -495,7 +630,7 @@ class ChatClient:
             self.peer_identity[src] = ident
             await self._complete_session(src, eph)
             return
-        if pkt.type in (MsgType.CHAT, MsgType.VOICE, MsgType.VIDEO, MsgType.IMAGE, MsgType.CONTROL):
+        if pkt.type in (MsgType.CHAT, MsgType.VOICE, MsgType.VIDEO, MsgType.IMAGE, MsgType.FILE, MsgType.CONTROL):
             await self._on_encrypted(pkt)
             return
         if pkt.type == MsgType.ERROR:
@@ -572,6 +707,13 @@ class ChatClient:
             try:
                 eng = self._ensure_video_engine()
                 src = eng.push_remote_frame(pt, source_hint=source_hint)
+                # Push JPEG to GUI if active
+                if self._gui_queue is not None and src in ("screen", "camera"):
+                    fr = eng.decoder.decode(pt)
+                    if fr and fr.img_b64:
+                        import base64 as _b64
+                        jpg = _b64.b64decode(fr.img_b64)
+                        self._gui_queue.put(("ui_video_jpeg", (jpg, src), {}))
                 # Show screen frames in terminal only when Canvas viewer has never been active
                 if src == "screen" and self.auto_show_screen:
                     from client.web_viewer import _viewer_ever_active
@@ -596,10 +738,23 @@ class ChatClient:
                 saved_path = save_received_image(meta, webp_bytes)
                 self._received_images[meta.id] = (meta, webp_bytes, preview)
                 self.ui(format_image_info(meta, who, saved_path))
-                if preview:
+                if self._gui_queue is not None:
+                    self.ui_image(meta.id, webp_bytes, who, meta.name, meta.width, meta.height)
+                elif preview:
                     self.ui(format_image_preview(meta, preview, who))
             except Exception as exc:
                 self.ui_status(f"image decode fail: {exc}")
+        elif pkt.type == MsgType.FILE:
+            who = self.peer_display.get(src, src)
+            try:
+                meta, file_bytes = unpack_file_payload(pt)
+                saved_path = save_received_file(meta, file_bytes)
+                self._received_files[meta.id] = (meta, file_bytes)
+                self.ui(format_file_info(meta, who, saved_path))
+                if self._gui_queue is not None:
+                    self.ui_file(meta.id, file_bytes, who, meta.name, meta.mime_type, meta.size)
+            except Exception as exc:
+                self.ui_status(f"file decode fail: {exc}")
         elif pkt.type == MsgType.CONTROL:
             await self._on_control_decrypted(pt, src)
 
@@ -613,10 +768,20 @@ class ChatClient:
             who = self.peer_display.get(src, src)
             status = "joined voice" if msg["voice_active"] else "left voice"
             self.ui_sys(f"{who} {status}")
+        elif "media_type" in msg:
+            who = self.peer_display.get(src, src)
+            media = msg["media_type"]
+            active = msg.get("media_active", False)
+            if active:
+                self.ui_sys(f"{who} sharing {media}")
+            else:
+                self.ui_sys(f"{who} stopped sharing {media}")
 
     # --- stdin commands ------------------------------------------------------
 
     async def input_loop(self) -> None:
+        if self._gui_mode:
+            return  # GUI handles input directly
         # Run blocking stdin in a thread
         while not self._stop.is_set():
             line = await asyncio.to_thread(sys.stdin.readline)
@@ -638,6 +803,28 @@ class ChatClient:
 
         if cmd in ("/quit", "/exit", "/q"):
             self._stop.set()
+            return
+        if cmd == "/help":
+            self.ui_sys("available commands:")
+            self.ui_sys("  /voice on|off|listen        — toggle voice chat")
+            self.ui_sys("  /video on|off               — toggle camera")
+            self.ui_sys("  /screen on|off [mode] [px]  — toggle screen share")
+            self.ui_sys("  /screen show on|off         — toggle remote screen in terminal")
+            self.ui_sys("  /show [camera|screen]       — show latest remote frame")
+            self.ui_sys("  /monitor N                 — set screen capture monitor")
+            self.ui_sys("  /monitors                  — list available monitors")
+            self.ui_sys("  /region L T W H | clear     — set screen capture region")
+            self.ui_sys("  /peers                     — list connected peers")
+            self.ui_sys("  /devices                   — list audio devices")
+            self.ui_sys("  /mic N                     — set mic input device")
+            self.ui_sys("  /speaker N                 — set speaker output device")
+            self.ui_sys("  /viewer [off]              — toggle browser canvas viewer")
+            self.ui_sys("  /sendimage <path>          — send an image")
+            self.ui_sys("  /sendfile <path>           — send a file")
+            self.ui_sys("  /images                    — list received images")
+            self.ui_sys("  /files                     — list received files")
+            self.ui_sys("  /download <id>             — re-save a received image")
+            self.ui_sys("  /quit                      — disconnect and exit")
             return
         if cmd == "/voice":
             if arg in ("on", "1", "start"):
@@ -823,17 +1010,28 @@ class ChatClient:
             path = " ".join(parts[1:])
             await self.send_image(path)
             return
+        if cmd in ("/sendfile", "/file"):
+            if len(parts) < 2:
+                self.ui_status("usage: /sendfile <path>")
+                return
+            path = " ".join(parts[1:])
+            await self.send_file(path)
+            return
         if cmd == "/download":
             if len(parts) < 2:
-                self.ui_status("usage: /download <image-id>  (see /images for IDs)")
+                self.ui_status("usage: /download <id>  (see /images or /files for IDs)")
                 return
-            img_id = parts[1]
-            if img_id not in self._received_images:
-                self.ui_status(f"unknown image id: {img_id}  (try /images)")
-                return
-            meta, webp_bytes, preview = self._received_images[img_id]
-            saved = save_received_image(meta, webp_bytes)
-            self.ui_sys(f"saved {meta.name} → {saved}")
+            dl_id = parts[1]
+            if dl_id in self._received_images:
+                meta, webp_bytes, preview = self._received_images[dl_id]
+                saved = save_received_image(meta, webp_bytes)
+                self.ui_sys(f"saved {meta.name} → {saved}")
+            elif dl_id in self._received_files:
+                meta, file_bytes = self._received_files[dl_id]
+                saved = save_received_file(meta, file_bytes)
+                self.ui_sys(f"saved {meta.name} → {saved}")
+            else:
+                self.ui_status(f"unknown id: {dl_id}  (try /images or /files)")
             return
         if cmd == "/images":
             if not self._received_images:
@@ -846,6 +1044,17 @@ class ChatClient:
                     f"WebP {size_kb:.1f} KB"
                 )
             self.ui_sys("use /download <id> to save, or /preview <id> to show again")
+            return
+        if cmd == "/files":
+            if not self._received_files:
+                self.ui_status("no files received yet")
+                return
+            for fid, (meta, _) in self._received_files.items():
+                size_kb = meta.size / 1024
+                self.ui(
+                    f"  [{fid}] {meta.name}  {meta.mime_type}  {size_kb:.1f} KB"
+                )
+            self.ui_sys("use /download <id> to save")
             return
         if cmd == "/preview":
             if len(parts) < 2:
@@ -929,6 +1138,10 @@ def main() -> None:
     ap.add_argument("--mode", type=int, default=5, help="Rendering mode (1-5)")
     ap.add_argument("--no-pixel", dest="pixel", action="store_false", help="Disable PIXEL mode (on by default)")
     ap.set_defaults(pixel=True)
+    ap.add_argument("--tor", action="store_true", help="route through Tor SOCKS5 proxy (default: socks5://127.0.0.1:9050)")
+    ap.add_argument("--tor-proxy", default="", help="SOCKS5 proxy URL (default: socks5://127.0.0.1:9050 when --tor is set)")
+    ap.add_argument("--gui", action="store_true", help="launch tkinter GUI")
+    ap.add_argument("--no-gui", action="store_true", help="force terminal mode")
     args = ap.parse_args()
 
     user = args.user or f"user-{os.getpid()}"
@@ -954,11 +1167,26 @@ def main() -> None:
         mode=args.mode,
         pixel=args.pixel,
         want_viewer=args.viewer,
+        tor_proxy=args.tor_proxy or ("socks5://127.0.0.1:9050" if args.tor else ""),
     )
-    try:
-        asyncio.run(client.run())
-    except KeyboardInterrupt:
-        print()
+
+    use_gui = args.gui
+    if not args.no_gui and not args.gui:
+        use_gui = not sys.stdin.isatty()
+
+    if use_gui:
+        try:
+            from client.gui import ChatGUI
+        except ImportError as exc:
+            print(f"GUI requires tkinter: {exc}", file=sys.stderr)
+            raise SystemExit(1)
+        gui = ChatGUI(client)
+        gui.run()
+    else:
+        try:
+            asyncio.run(client.run())
+        except KeyboardInterrupt:
+            print()
 
 
 if __name__ == "__main__":

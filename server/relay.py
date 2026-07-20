@@ -83,6 +83,7 @@ class Relay:
             MsgType.VOICE,
             MsgType.VIDEO,
             MsgType.IMAGE,
+            MsgType.FILE,
             MsgType.CONTROL,
         ):
             await self._broadcast(peer, pkt)
@@ -190,16 +191,61 @@ async def main_async(host: str, port: int) -> None:
         await server.serve_forever()
 
 
+def _setup_hidden_service(port: int, control_port: int, control_host: str) -> str | None:
+    """Create an ephemeral Tor hidden service via stem. Returns the .onion address."""
+    try:
+        from stem.control import Controller
+    except ImportError:
+        print("[tor] stem library not installed. Install with: pip install stem", file=sys.stderr)
+        print("[tor] Manual setup: add to /etc/tor/torrc:", file=sys.stderr)
+        print(f"[tor]   HiddenServiceDir /var/lib/tor/chat-relay/", file=sys.stderr)
+        print(f"[tor]   HiddenServicePort 80 127.0.0.1:{port}", file=sys.stderr)
+        return None
+
+    try:
+        controller = Controller.from_port(address=control_host, port=control_port)
+        controller.authenticate()
+    except Exception as exc:
+        print(f"[tor] cannot connect to Tor ControlPort ({control_host}:{control_port}): {exc}", file=sys.stderr)
+        print("[tor] Ensure Tor is running with ControlPort enabled in torrc:", file=sys.stderr)
+        print(f"[tor]   ControlPort {control_port}", file=sys.stderr)
+        print(f"[tor]   CookieAuthentication 1", file=sys.stderr)
+        return None
+
+    try:
+        response = controller.create_ephemeral_hidden_service(
+            f"80:127.0.0.1:{port}",
+            detached=True,
+        )
+        onion = response.service_id + ".onion"
+        log.info("tor hidden service: %s", onion)
+        print(f"\n{'='*60}", file=sys.stderr)
+        print(f"  Tor hidden service active: {onion}", file=sys.stderr)
+        print(f"  Clients can connect with: --tor --host {onion}", file=sys.stderr)
+        print(f"{'='*60}\n", file=sys.stderr)
+        return onion
+    except Exception as exc:
+        print(f"[tor] failed to create hidden service: {exc}", file=sys.stderr)
+        return None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="E2E ASCILINE chat relay (untrusted)")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=9473)
+    ap.add_argument("--tor", action="store_true", help="create a Tor hidden service")
+    ap.add_argument("--tor-control-port", type=int, default=9051, help="Tor ControlPort (default: 9051)")
+    ap.add_argument("--tor-control-host", default="127.0.0.1", help="Tor ControlPort host")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    if args.tor:
+        _setup_hidden_service(args.port, args.tor_control_port, args.tor_control_host)
+
     try:
         asyncio.run(main_async(args.host, args.port))
     except KeyboardInterrupt:

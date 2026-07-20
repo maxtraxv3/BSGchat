@@ -7,6 +7,7 @@ The browser polls GET /frame and GET /audio, renders via requestAnimationFrame.
 from __future__ import annotations
 
 import base64
+import collections
 import http.server
 import json
 import struct
@@ -47,10 +48,12 @@ const ctx = canvas.getContext('2d');
 const info = document.getElementById('info');
 const audioBtn = document.getElementById('audio-btn');
 let frames = 0, lastFps = 0, fpsTime = performance.now();
-let audioCtx = null, audioEnabled = false, audioPending = false;
+let audioCtx = null, audioEnabled = false;
 let audioNextTime = 0;
 const SAMPLE_RATE = 8000;
-const CHUNK_MS = 40;
+const CHUNK_MS = 80;
+const CHUNK_SAMPLES = SAMPLE_RATE * CHUNK_MS / 1000; // 640
+const BUF_AHEAD = 4; // keep 4 chunks scheduled ahead (~320ms buffer)
 
 function enableAudio() {
   if (!audioCtx) {
@@ -58,9 +61,10 @@ function enableAudio() {
   }
   if (audioCtx.state === 'suspended') audioCtx.resume();
   audioEnabled = true;
+  audioNextTime = 0;
   audioBtn.textContent = 'Mute';
   audioBtn.style.borderColor = '#555';
-  if (!audioPending) pollAudio();
+  audioFetchLoop();
 }
 
 audioBtn.addEventListener('click', () => {
@@ -73,36 +77,38 @@ audioBtn.addEventListener('click', () => {
   }
 });
 
-function pollAudio() {
-  if (!audioEnabled) { audioPending = false; return; }
-  audioPending = true;
+function scheduleChunk(pcmBytes) {
+  if (!audioCtx || !audioEnabled) return;
+  const raw = atob(pcmBytes);
+  const samples = raw.length / 2;
+  const buf = new Int16Array(samples);
+  for (let i = 0; i < samples; i++)
+    buf[i] = (raw.charCodeAt(i*2) & 0xff) | (raw.charCodeAt(i*2+1) << 8);
+  const abuf = audioCtx.createBuffer(1, samples, SAMPLE_RATE);
+  const f32 = abuf.getChannelData(0);
+  for (let i = 0; i < samples; i++) f32[i] = buf[i] / 32768;
+  const now = audioCtx.currentTime;
+  // If we've fallen too far behind, snap forward
+  if (audioNextTime < now - CHUNK_MS * BUF_AHEAD / 1000) audioNextTime = now;
+  // If we're behind real-time, catch up
+  if (audioNextTime < now) audioNextTime = now;
+  const src = audioCtx.createBufferSource();
+  src.buffer = abuf;
+  src.connect(audioCtx.destination);
+  src.start(audioNextTime);
+  audioNextTime += abuf.duration;
+}
+
+function audioFetchLoop() {
+  if (!audioEnabled) return;
   fetch('/audio')
     .then(r => r.json())
     .then(data => {
-      if (data.pcm && audioEnabled) {
-        if (!audioCtx) audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
-        if (audioCtx.state === 'suspended') audioCtx.resume();
-        const raw = atob(data.pcm);
-        const buf = new Int16Array(raw.length / 2);
-        for (let i = 0; i < buf.length; i++)
-          buf[i] = (raw.charCodeAt(i*2) & 0xff) | (raw.charCodeAt(i*2+1) << 8);
-        const abuf = audioCtx.createBuffer(1, buf.length, SAMPLE_RATE);
-        const float32 = abuf.getChannelData(0);
-        for (let i = 0; i < buf.length; i++) float32[i] = buf[i] / 32768;
-        // Schedule playback: if we're ahead, play immediately; otherwise skip
-        const now = audioCtx.currentTime;
-        if (audioNextTime < now) audioNextTime = now;
-        const src = audioCtx.createBufferSource();
-        src.buffer = abuf;
-        src.connect(audioCtx.destination);
-        src.start(audioNextTime);
-        audioNextTime += abuf.duration;
-        // If we've fallen behind by more than 2 chunks, snap forward
-        if (audioNextTime < now - CHUNK_MS * 2 / 1000) audioNextTime = now;
-      }
-      setTimeout(pollAudio, CHUNK_MS);
+      if (data.pcm && audioEnabled) scheduleChunk(data.pcm);
+      // Chain next fetch immediately — no setTimeout gap
+      audioFetchLoop();
     })
-    .catch(() => { setTimeout(pollAudio, CHUNK_MS); });
+    .catch(() => { setTimeout(audioFetchLoop, 100); });
 }
 
 function tick() {
@@ -145,7 +151,8 @@ class _FrameServer:
 
     def __init__(self) -> None:
         self._jpeg: bytes = b""
-        self._pcm: bytes = b""  # raw int16 PCM chunks
+        self._pcm: bytes = b""  # latest chunk (fallback)
+        self._pcm_queue: collections.deque = collections.deque(maxlen=200)
         self._lock = threading.Lock()
         self._server: Optional[http.server.HTTPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -187,7 +194,7 @@ class _FrameServer:
                     self.wfile.write(json.dumps({"data": b64}).encode())
                 elif self.path == "/audio":
                     with server_ref._lock:
-                        pcm = server_ref._pcm
+                        pcm = server_ref._pcm_queue.popleft() if server_ref._pcm_queue else server_ref._pcm
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Cache-Control", "no-store")
@@ -224,11 +231,79 @@ class _FrameServer:
         self._audio_thread.start()
 
     def _audio_loop(self) -> None:
+        """Capture system audio from the default output sink's monitor."""
+        import sys
+
+        if sys.platform == "win32":
+            self._audio_loop_windows()
+        else:
+            self._audio_loop_linux()
+
+    def _audio_loop_windows(self) -> None:
+        """Capture system audio via WASAPI loopback on Windows."""
+        import sys
+        try:
+            import sounddevice as sd
+
+            # Find WASAPI loopback device
+            loopback_device = None
+            try:
+                if hasattr(sd, "WasapiSettings"):
+                    wasapi_settings = sd.WasapiSettings(loopback=True)
+                else:
+                    wasapi_settings = None
+            except Exception:
+                wasapi_settings = None
+
+            # Use default output device with loopback
+            default_out = sd.default.device[1]  # output device
+            devices = sd.query_devices()
+            if isinstance(devices, dict):
+                devices = list(devices.values()) if devices else []
+
+            # Find the loopback equivalent of the default output
+            dev_info = sd.query_devices(default_out)
+            dev_name = dev_info.get("name", "")
+
+            RATE = 8000
+            CHUNK_SAMPLES = 640  # 80ms at 8kHz
+
+            print(f"[viewer-audio] capturing via WASAPI loopback (device: {dev_name})", file=sys.stderr, flush=True)
+
+            def callback(indata, frames, time_info, status):
+                if status:
+                    pass  # ignore overflow warnings
+                if self._audio_running:
+                    pcm = bytes(indata)
+                    with self._lock:
+                        self._pcm = pcm
+                        self._pcm_queue.append(pcm)
+
+            kwargs = {}
+            if wasapi_settings is not None:
+                kwargs["extra_settings"] = wasapi_settings
+
+            with sd.InputStream(
+                device=default_out,
+                channels=1,
+                samplerate=RATE,
+                dtype="int16",
+                blocksize=CHUNK_SAMPLES,
+                callback=callback,
+                **kwargs,
+            ):
+                while self._audio_running:
+                    sd.sleep(100)
+
+        except Exception as exc:
+            print(f"[viewer-audio] WASAPI error: {exc}", file=sys.stderr, flush=True)
+            self._audio_running = False
+
+    def _audio_loop_linux(self) -> None:
         """Capture system audio from the default output sink's monitor via pw-record."""
         import sys
         import subprocess
         import shutil
-        import struct
 
         try:
             # Find default output sink and construct monitor source name
@@ -260,7 +335,7 @@ class _FrameServer:
 
             RATE = 8000
             CHANNELS = 1
-            CHUNK_SAMPLES = 320  # 40ms at 8kHz
+            CHUNK_SAMPLES = 640  # 80ms at 8kHz
 
             print(f"[viewer-audio] capturing from {monitor_source}", file=sys.stderr, flush=True)
 
@@ -285,6 +360,7 @@ class _FrameServer:
                     break
                 with self._lock:
                     self._pcm = raw
+                    self._pcm_queue.append(raw)
 
             proc.terminate()
             try:
