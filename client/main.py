@@ -96,6 +96,7 @@ class ChatClient:
         auto_show_screen: bool = False,
         want_viewer: bool = False,
         tor_proxy: str = "",
+        upnp: bool = False,
     ) -> None:
         self.host = host
         self.port = port
@@ -118,6 +119,8 @@ class ChatClient:
         self.pixel = pixel
         self.auto_show_screen = auto_show_screen
         self.tor_proxy = tor_proxy
+        self.upnp = upnp
+        self._upnp_mapping = None
         self._last_shown_seq: dict[str, int] = {}
         self._frame_lines: int = 0  # lines printed by last video frame (for in-place update)
         self._received_images: dict[str, tuple[ImageMessage, bytes, str]] = {}  # id → (meta, webp, preview)
@@ -735,9 +738,8 @@ class ChatClient:
             who = self.peer_display.get(src, src)
             try:
                 meta, webp_bytes, preview = unpack_image_payload(pt)
-                saved_path = save_received_image(meta, webp_bytes)
                 self._received_images[meta.id] = (meta, webp_bytes, preview)
-                self.ui(format_image_info(meta, who, saved_path))
+                self.ui(format_image_info(meta, who))
                 if self._gui_queue is not None:
                     self.ui_image(meta.id, webp_bytes, who, meta.name, meta.width, meta.height)
                 elif preview:
@@ -748,9 +750,8 @@ class ChatClient:
             who = self.peer_display.get(src, src)
             try:
                 meta, file_bytes = unpack_file_payload(pt)
-                saved_path = save_received_file(meta, file_bytes)
                 self._received_files[meta.id] = (meta, file_bytes)
-                self.ui(format_file_info(meta, who, saved_path))
+                self.ui(format_file_info(meta, who))
                 if self._gui_queue is not None:
                     self.ui_file(meta.id, file_bytes, who, meta.name, meta.mime_type, meta.size)
             except Exception as exc:
@@ -1093,6 +1094,14 @@ class ChatClient:
             try:
                 port = start_viewer()
                 self.ui_sys(f"canvas viewer open at http://127.0.0.1:{port}")
+                if self.upnp:
+                    from shared.upnp import setup_port_mapping
+                    self._upnp_mapping = setup_port_mapping(
+                        port, description="Asciline Viewer",
+                    )
+                    if self._upnp_mapping:
+                        ext_ip = self._upnp_mapping.external_ip or "?"
+                        self.ui_sys(f"UPnP: viewer reachable at http://{ext_ip}:{port}")
             except Exception as exc:
                 self.ui_status(f"viewer failed: {exc}")
         if self.want_screen:
@@ -1103,6 +1112,9 @@ class ChatClient:
         self.stop_voice()
         self.stop_video()
         self.stop_screen()
+        if self._upnp_mapping:
+            self._upnp_mapping.cleanup()
+            self._upnp_mapping = None
         recv_task.cancel()
         input_task.cancel()
         if self.writer:
@@ -1140,6 +1152,7 @@ def main() -> None:
     ap.set_defaults(pixel=True)
     ap.add_argument("--tor", action="store_true", help="route through Tor SOCKS5 proxy (default: socks5://127.0.0.1:9050)")
     ap.add_argument("--tor-proxy", default="", help="SOCKS5 proxy URL (default: socks5://127.0.0.1:9050 when --tor is set)")
+    ap.add_argument("--upnp", action="store_true", help="map viewer port via UPnP IGD")
     ap.add_argument("--gui", action="store_true", help="launch tkinter GUI")
     ap.add_argument("--no-gui", action="store_true", help="force terminal mode")
     args = ap.parse_args()
@@ -1168,6 +1181,7 @@ def main() -> None:
         pixel=args.pixel,
         want_viewer=args.viewer,
         tor_proxy=args.tor_proxy or ("socks5://127.0.0.1:9050" if args.tor else ""),
+        upnp=args.upnp,
     )
 
     use_gui = args.gui

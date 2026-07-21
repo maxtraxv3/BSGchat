@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import os
 import queue
 import sys
 import threading
@@ -59,9 +60,9 @@ class ViewerWindow:
                                  font=("monospace", 9), anchor="w", padx=6, pady=3)
         self.lbl_meta.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        self.btn_audio = tk.Button(bottom, text="Audio Off", command=self._toggle_audio,
-                                   bg=BG_PANEL, fg=FG, activebackground="#333",
-                                   relief=tk.FLAT, padx=8, font=("monospace", 9))
+        self.btn_audio = tk.Button(bottom, text="Audio On", command=self._toggle_audio,
+                                    bg=BG_PANEL, fg=FG, activebackground="#333",
+                                    relief=tk.FLAT, padx=8, font=("monospace", 9))
         self.btn_audio.pack(side=tk.RIGHT, padx=6)
 
         self._start_audio_capture()
@@ -176,14 +177,15 @@ class ViewerWindow:
             )
 
             import sounddevice as sd
+            import numpy as np
             play_queue: queue.Queue = queue.Queue(maxlen=20)
 
             def playback_cb(outdata, frames, time_info, status):
                 try:
                     data = play_queue.get_nowait()
-                    outdata[:len(data)//2] = data
+                    outdata[:, 0] = np.frombuffer(data, dtype=np.int16)[:frames]
                 except queue.Empty:
-                    pass
+                    outdata[:] = 0
 
             with sd.OutputStream(channels=1, samplerate=RATE, dtype="int16",
                                 blocksize=CHUNK_SAMPLES, callback=playback_cb):
@@ -238,8 +240,85 @@ class ChatGUI:
         self._viewer_active = False
         self._viewer_window: ViewerWindow | None = None
 
+        self._show_connect_dialog()
+
+    # -------------------------------------------------------- connect dialog
+    def _show_connect_dialog(self) -> None:
+        import random as _rand
+
+        self._connect_frame = tk.Frame(self.root, bg=BG)
+        self._connect_frame.pack(fill=tk.BOTH, expand=True)
+
+        center = tk.Frame(self._connect_frame, bg=BG)
+        center.place(relx=0.5, rely=0.5, anchor="center")
+
+        title = tk.Label(center, text="Asciline Chat", bg=BG, fg=FG,
+                         font=("monospace", 18, "bold"))
+        title.pack(pady=(0, 20))
+
+        field_frame = tk.Frame(center, bg=BG)
+        field_frame.pack()
+
+        lbl_style = dict(bg=BG, fg=FG, font=("monospace", 11), anchor="e")
+        ent_style = dict(bg="#2d2d2d", fg=FG, insertbackground=FG,
+                         font=("monospace", 11), relief=tk.FLAT, bd=4,
+                         width=28)
+
+        tk.Label(field_frame, text="Host:", **lbl_style).grid(row=0, column=0, padx=(0, 8), pady=4, sticky="e")
+        self._ent_host = tk.Entry(field_frame, **ent_style)
+        self._ent_host.insert(0, self.client.host)
+        self._ent_host.grid(row=0, column=1, pady=4)
+
+        tk.Label(field_frame, text="Port:", **lbl_style).grid(row=1, column=0, padx=(0, 8), pady=4, sticky="e")
+        self._ent_port = tk.Entry(field_frame, **ent_style)
+        self._ent_port.insert(0, str(self.client.port))
+        self._ent_port.grid(row=1, column=1, pady=4)
+
+        tk.Label(field_frame, text="Room:", **lbl_style).grid(row=2, column=0, padx=(0, 8), pady=4, sticky="e")
+        self._ent_room = tk.Entry(field_frame, **ent_style)
+        self._ent_room.insert(0, "demo")
+        self._ent_room.grid(row=2, column=1, pady=4)
+
+        tk.Label(field_frame, text="Name:", **lbl_style).grid(row=3, column=0, padx=(0, 8), pady=4, sticky="e")
+        self._ent_name = tk.Entry(field_frame, **ent_style)
+        default_name = f"user-{_rand.randint(1000, 9999)}"
+        self._ent_name.insert(0, default_name)
+        self._ent_name.grid(row=3, column=1, pady=4)
+
+        btn_frame = tk.Frame(center, bg=BG)
+        btn_frame.pack(pady=(20, 0))
+        connect_btn = tk.Button(btn_frame, text="Connect", command=self._on_connect,
+                                bg="#0e639c", fg=FG, activebackground="#1177bb",
+                                font=("monospace", 12, "bold"), relief=tk.FLAT,
+                                padx=24, pady=6)
+        connect_btn.pack()
+
+        self._ent_host.focus_set()
+        self.root.bind("<Return>", lambda e: self._on_connect())
+
+    def _on_connect(self) -> None:
+        if not hasattr(self, "_connect_frame") or self._connect_frame is None:
+            return
+        host = self._ent_host.get().strip() or self.client.host
+        try:
+            port = int(self._ent_port.get().strip() or str(self.client.port))
+        except ValueError:
+            port = self.client.port
+        room = self._ent_room.get().strip() or "demo"
+        name = self._ent_name.get().strip() or f"user-{os.getpid()}"
+
+        self.client.host = host
+        self.client.port = port
+        self.client.room = room
+        self.client.user_id = name
+        self.client.display = name
+
+        self._connect_frame.destroy()
+        self._connect_frame = None
+        self.root.unbind("<Return>")
         self._build_toolbar()
         self._build_main()
+        self._start_asyncio_thread()
 
     # ------------------------------------------------------------------ build
     def _build_toolbar(self) -> None:
@@ -610,7 +689,6 @@ class ChatGUI:
         self._async_thread.start()
 
     def run(self) -> None:
-        self._start_asyncio_thread()
         self._poll_queue()
         self.root.mainloop()
 

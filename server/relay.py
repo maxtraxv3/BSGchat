@@ -182,13 +182,26 @@ class Relay:
             await self._leave(p)
 
 
-async def main_async(host: str, port: int) -> None:
+async def main_async(host: str, port: int, upnp: bool = True) -> None:
     relay = Relay()
     server = await asyncio.start_server(relay.handle, host, port)
     addrs = ", ".join(str(s.getsockname()) for s in server.sockets or [])
     log.info("relay listening on %s (blind E2E media relay)", addrs)
-    async with server:
-        await server.serve_forever()
+
+    mapping = None
+    if upnp and host in ("0.0.0.0", ""):
+        from shared.upnp import setup_port_mapping
+        mapping = setup_port_mapping(port, description="Asciline Relay")
+        if mapping:
+            ext_ip = mapping.external_ip or "?"
+            log.info("UPnP: external %s:%d -> %s:%d", ext_ip, port, mapping.lan_ip, port)
+
+    try:
+        async with server:
+            await server.serve_forever()
+    finally:
+        if mapping:
+            mapping.cleanup()
 
 
 def _setup_hidden_service(port: int, control_port: int, control_host: str) -> str | None:
@@ -233,6 +246,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="E2E ASCILINE chat relay (untrusted)")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=9473)
+    ap.add_argument("--no-upnp", dest="upnp", action="store_false", help="disable UPnP port mapping")
     ap.add_argument("--tor", action="store_true", help="create a Tor hidden service")
     ap.add_argument("--tor-control-port", type=int, default=9051, help="Tor ControlPort (default: 9051)")
     ap.add_argument("--tor-control-host", default="127.0.0.1", help="Tor ControlPort host")
@@ -247,7 +261,7 @@ def main() -> None:
         _setup_hidden_service(args.port, args.tor_control_port, args.tor_control_host)
 
     try:
-        asyncio.run(main_async(args.host, args.port))
+        asyncio.run(main_async(args.host, args.port, upnp=args.upnp))
     except KeyboardInterrupt:
         print()
 

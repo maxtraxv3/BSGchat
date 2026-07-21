@@ -5,3 +5,4 @@ opencv-python-headless>=4.8.0
 pillow>=10.0.0
 mss>=9.0.0
 python-socks[asyncio]>=2.0.0
+miniupnpc>=2.3.0
