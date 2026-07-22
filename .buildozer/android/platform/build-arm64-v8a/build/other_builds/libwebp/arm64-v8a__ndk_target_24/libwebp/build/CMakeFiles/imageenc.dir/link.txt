@@ -1,0 +1,2 @@
+/home/maxtrax/.buildozer/android/platform/android-ndk-r26b/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar qc libimageenc.a CMakeFiles/imageenc.dir/imageio/image_enc.c.o
+/home/maxtrax/.buildozer/android/platform/android-ndk-r26b/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib libimageenc.a

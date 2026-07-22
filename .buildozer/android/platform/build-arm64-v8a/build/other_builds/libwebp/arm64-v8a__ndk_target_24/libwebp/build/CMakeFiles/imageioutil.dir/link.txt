@@ -1,0 +1,2 @@
+/home/maxtrax/.buildozer/android/platform/android-ndk-r26b/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar qc libimageioutil.a CMakeFiles/imageioutil.dir/imageio/imageio_util.c.o
+/home/maxtrax/.buildozer/android/platform/android-ndk-r26b/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib libimageioutil.a

@@ -1,0 +1,2 @@
+/home/maxtrax/.buildozer/android/platform/android-ndk-r26b/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar qc libexampleutil.a CMakeFiles/exampleutil.dir/examples/example_util.c.o
+/home/maxtrax/.buildozer/android/platform/android-ndk-r26b/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib libexampleutil.a

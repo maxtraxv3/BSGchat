@@ -5,10 +5,11 @@ End-to-end encrypted chat with:
 - **Text chat** — ChaCha20-Poly1305 over X25519 session keys
 - **ASCIILINE video** — terminal ASCII frames from **camera** and/or **screen share**
 - **Canvas viewer** — browser-based JPEG viewer with system audio playback
-- **ADPCM voice** — IMA/DVI ADPCM @ 32 kb/s (free, public-domain, ultra-low CPU)
+- **ADPCM voice** — IMA/DVI ADPCM @ 64 kb/s (free, public-domain, ultra-low CPU)
 - **Image sharing** — any image format → WebP with ASCII preview
 - **File sharing** — send any file (up to 1 MiB) with E2E encryption
 - **tkinter GUI** — optional graphical interface with connection dialog, peer list, and inline image/file previews
+- **Android** — Kivy mobile client with Camera1 (camera) + MediaProjection (screen) + mic/speaker via AudioRecord/AudioTrack
 - **Tor support** — route through Tor hidden services for anonymous relay hosting
 - **UPnP IGD** — automatic port mapping for relay and viewer on NAT networks
 - **Windows** — standalone `.exe` builds for Windows 10/11 (GUI client + relay server)
@@ -106,6 +107,84 @@ git push --tags
 
 The workflow builds both `.exe` files on `windows-latest` and attaches them to a GitHub Release.
 
+## Building for Android
+
+An Android APK can be built using [Buildozer](https://buildozer.readthedocs.io/) + [python-for-android](https://python-for-android.readthedocs.io/).
+
+### Local build on Ubuntu / Debian
+
+```bash
+sudo apt install build-essential git python3-pip autoconf libtool pkg-config \
+  zlib1g-dev libncurses5-dev libtinfo5 cmake libffi-dev libssl-dev openjdk-17-jdk
+
+pip install buildozer cython
+buildozer android debug
+```
+
+Output: `bin/asciline-debug.apk`
+
+### Local build on CachyOS / Arch Linux
+
+```bash
+sudo pacman -S base-devel git python-pip autoconf libtool pkgconf zlib \
+  ncurses cmake libffi openssl jdk17-openjdk
+
+pip install buildozer cython
+buildozer android debug
+```
+
+### Local build on Windows
+
+Buildozer requires Linux. On Windows you have two options:
+
+**Option A — WSL2 (recommended)**
+
+```powershell
+wsl --install -d Ubuntu-22.04
+# Inside WSL:
+sudo apt install build-essential git python3-pip autoconf libtool pkg-config \
+  zlib1g-dev libncurses5-dev libtinfo5 cmake libffi-dev libssl-dev openjdk-17-jdk
+pip install buildozer cython
+buildozer android debug
+```
+
+The APK will be in `~/e2e-asciline-chat2/bin/`. Copy it out with:
+
+```powershell
+wsl cat ~/e2e-asciline-chat2/bin/asciline-debug.apk > asciline-debug.apk
+```
+
+**Option B — Docker**
+
+```powershell
+docker run --rm -v "%CD%:/app" -w /app \
+  cython3/buildozer:latest android debug
+```
+
+### Build via GitHub Actions (any OS)
+
+Pushing a tag starting with `v` (e.g. `v1.0.0`) triggers an automated build — no local toolchain needed:
+
+```bash
+git tag v1.0.0
+git push --tags
+```
+
+The workflow builds a debug APK on `ubuntu-latest` and attaches it to a GitHub Release.
+
+### What it includes
+
+The Android app reuses the same crypto, protocol, and codec layers as the desktop client. It features:
+
+- Connection screen with host/port/room/name fields
+- Chat with inline message display
+- Mic / Camera / Screen toggle buttons
+- Image and file sharing via Android file picker
+- E2E encryption (X25519 + ChaCha20-Poly1305)
+- Camera via Camera1 API (front-facing, 320x240 preview)
+- Screen capture via MediaProjection API with foreground service (Android 14+)
+- Mic/speaker via AudioRecord/AudioTrack (16 kHz ADPCM)
+
 ## Canvas viewer
 
 The Canvas viewer renders screen share as JPEG in a browser with system audio playback. In GUI mode, the viewer opens as a separate tkinter popup window instead.
@@ -136,8 +215,8 @@ The viewer captures system audio (what plays through your speakers) from the sha
       ├─ X25519 identity + ephemeral (triple-DH style)               │
       ├─ HKDF-SHA256 → directional ChaCha20-Poly1305                 │
       ├─ Chat: JSON text                                             │
-      ├─ Voice: ADPCM/ima-v1 frames (20 ms, 8 kHz)                  │
-      ├─ Video: ASCIINE/1.0 frames                                   │
+      ├─ Voice: ADPCM/ima-v1 frames (20 ms, 16 kHz)                │
+      ├─ Video: ASCIILINE/1.0 frames                               │
       ├─ Image: WebP + ASCII preview                                 │
       ├─ File: raw bytes + metadata                                  │
       └─ Control: key exchange, media presence, peer info            │
@@ -205,9 +284,9 @@ The `IMG:` field carries a base64-encoded JPEG thumbnail (640×360, quality 60) 
 
 | Property | Value |
 |----------|--------|
-| Sample rate | 8 kHz mono |
-| Frame | 20 ms (160 samples) |
-| Bitrate | 32 kb/s active |
+| Sample rate | 16 kHz mono |
+| Frame | 20 ms (320 samples) |
+| Bitrate | 64 kb/s active |
 | DTX | silence suppression with SID frames |
 | Payload tag | `ADPCM/ima-v1` |
 
@@ -219,7 +298,7 @@ The Canvas viewer captures system audio from the screen-sharing PC via PipeWire/
 
 - Uses `pactl info` to find the default output sink
 - Constructs `<sink>.monitor` source name
-- Captures via `pw-record` at 8 kHz mono
+- Captures via `pw-record` at 16 kHz mono
 - Streams to browser via HTTP polling (`GET /audio`)
 - Browser decodes PCM and plays via Web Audio API
 
@@ -243,25 +322,32 @@ Send any file up to 1 MiB with `/sendfile <path>`. Files are E2E encrypted like 
 
 ```
 e2e-asciline-chat2/
-  server/relay.py          # blind room relay
-  client/main.py           # interactive client
-  client/gui.py            # tkinter GUI + viewer popup
-  client/audio_io.py       # mic/speaker + ADPCM
-  client/video_io.py       # camera + ASCIILINE + screen loop
-  client/screencap.py      # desktop capture backends + persistent GSR
-  client/web_viewer.py     # Canvas viewer HTTP server + audio capture
-  shared/crypto.py         # X25519 + ChaCha20-Poly1305
-  shared/protocol.py       # length-prefixed packets
-  shared/adpcm.py          # IMA/DVI ADPCM voice codec
-  shared/asciline.py       # ASCIILINE codec
-  shared/image_share.py    # WebP image sharing
-  shared/file_share.py     # generic file transfer
-  shared/upnp.py           # UPnP IGD port mapping
+  server/relay.py              # blind room relay
+  client/main.py               # interactive client (terminal + asyncio)
+  client/gui.py                # tkinter GUI + viewer popup
+  client/audio_io.py           # mic/speaker + ADPCM (sounddevice/WASAPI)
+  client/video_io.py           # camera + ASCIILINE + screen loop
+  client/screencap.py          # desktop capture backends + persistent GSR
+  client/web_viewer.py         # Canvas viewer HTTP server + audio capture
+  client/android_app/
+    __init__.py
+    main.py                    # Kivy mobile UI (connection + chat screens)
+    android_audio.py           # mic/speaker via Java AudioRecord/AudioTrack
+    android_video.py           # camera (Camera1) + screen (MediaProjection)
+    foreground_service.py      # Android 14+ MediaProjection foreground service
+  shared/crypto.py             # X25519 + ChaCha20-Poly1305
+  shared/protocol.py           # length-prefixed packets
+  shared/adpcm.py              # IMA/DVI ADPCM voice codec (16 kHz)
+  shared/asciline.py           # ASCIILINE codec (PIL, no cv2 required)
+  shared/image_share.py        # WebP image sharing
+  shared/file_share.py         # generic file transfer
+  shared/upnp.py               # UPnP IGD port mapping
   tests/
   requirements.txt
-  build.py                 # Windows .exe build script
-  asciline-relay.spec      # PyInstaller spec (relay)
-  asciline-client.spec     # PyInstaller spec (GUI client)
+  buildozer.spec               # Android APK build config (API 35)
+  build.py                     # Windows .exe build script
+  asciline-relay.spec          # PyInstaller spec (relay)
+  asciline-client.spec         # PyInstaller spec (GUI client)
 ```
 
 ## Notes
@@ -272,3 +358,4 @@ e2e-asciline-chat2/
 - **UPnP**: Both the relay and viewer can auto-map ports via UPnP IGD when `--upnp` is set (relay does this by default). Requires `miniupnpc` (included in `requirements.txt`). Falls back gracefully if no UPnP gateway is found.
 - **Tor**: The relay can create an ephemeral hidden service with `--tor` (requires Tor with ControlPort enabled and the `stem` library). Clients connect via `--tor` which routes through a local SOCKS5 proxy.
 - **GUI**: Run with `--gui` or just run from a non-TTY (the GUI auto-launches). A connection dialog prompts for host/port/room/name before connecting. The viewer opens as a separate popup window with audio capture.
+- **Android**: Built with Buildozer + python-for-android. Camera uses Camera1 API (pyjnius cannot proxy Camera2's abstract StateCallback). Screen capture uses MediaProjection API with a foreground service (required on Android 14+). The Java `ScreenCaptureHelper` class is compiled into the APK via `android.add_src = src`.

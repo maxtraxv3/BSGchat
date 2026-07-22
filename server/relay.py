@@ -32,7 +32,6 @@ class Peer:
         self.display: str = ""
         self.identity_pub: bytes = b""
         self.room: str = ""
-        self.addr = writer.get_extra_info("peername")
 
     async def send(self, packet: Packet) -> None:
         self.writer.write(packet.encode())
@@ -47,7 +46,7 @@ class Relay:
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = Peer(reader, writer)
         fr = FrameReader()
-        log.info("connect %s", peer.addr)
+        log.info("connect")
         try:
             while True:
                 data = await reader.read(65536)
@@ -55,10 +54,10 @@ class Relay:
                     break
                 for pkt in fr.feed(data):
                     await self._dispatch(peer, pkt)
-        except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
+        except (asyncio.IncompleteReadError, ConnectionError, OSError):
             pass
         except Exception:
-            log.exception("peer error %s", peer.addr)
+            log.exception("peer error")
         finally:
             await self._leave(peer)
             try:
@@ -66,7 +65,7 @@ class Relay:
                 await writer.wait_closed()
             except Exception:
                 pass
-            log.info("disconnect %s (%s)", peer.addr, peer.user_id or "?")
+            log.info("disconnect (%s)", peer.user_id or "?")
 
     async def _dispatch(self, peer: Peer, pkt: Packet) -> None:
         if pkt.type == MsgType.HELLO:
@@ -254,7 +253,7 @@ def main() -> None:
     args = ap.parse_args()
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format="%(levelname)s %(name)s: %(message)s",
     )
 
     if args.tor:
