@@ -28,26 +28,26 @@ pip install -r requirements.txt
 python server/relay.py --port 9473
 
 # Terminal 2 — Alice (camera + screen share + viewer)
-python client/main.py --user alice --room demo --voice --video --screen --viewer
+python client/main.py --gui
 
 # Terminal 3 — Bob
-python client/main.py --user bob --room demo --voice --video
+python client/main.py --gui
 ```
 
 Type messages normally. Commands:
 
 | Command | Action |
 |--------|--------|
-| `/voice on\|off` | ADPCM voice chat |
-| `/video on\|off` | ASCIILINE **camera** track |
-| `/screen on\|off` | ASCIILINE **desktop screen share** |
-| `/screen show on\|off` | toggle remote screen frames in terminal (default: off) |
+| `/voice on | off` | ADPCM voice chat |
+| `/video on | off` | ASCIILINE **camera** track |
+| `/screen on | off` | ASCIILINE **desktop screen share** |
+| `/screen show on | off` | toggle remote screen frames in terminal (default: off) |
 | `/viewer [off]` | open/close Canvas viewer in browser |
 | `/monitors` | list displays |
 | `/monitor N` | pick monitor for screen share (0 = all) |
 | `/region L T W H` | crop screen share to a pixel region |
 | `/region clear` | full monitor again |
-| `/show [camera\|screen]` | redraw last remote ASCII frame |
+| `/show [camera | screen]` | redraw last remote ASCII frame |
 | `/sendimage <path>` | send an image (auto-converted to WebP) |
 | `/images` | list received images |
 | `/sendfile <path>` | send a file (up to 1 MiB) |
@@ -82,15 +82,15 @@ Two standalone `.exe` files can be built — a console relay server and a window
 ### Local build (on Windows)
 
 ```bash
-git clone https://github.com/YOU/e2e-asciline-chat2.git
-cd e2e-asciline-chat2
+git clone https://github.com/maxtraxv3/e2e-asciline-chat.git
+cd e2e-asciline-chat
 pip install -r requirements.txt pyinstaller
 python build.py
 ```
 
 Produces:
 - `dist/asciline-relay.exe` — relay server (console)
-- `dist/asciline-client.exe` — GUI client (no console window)
+- `dist/asciline-client.exe` — GUI client
 
 ### Pre-built downloads
 
@@ -129,6 +129,8 @@ Output: `bin/asciline-debug.apk`
 sudo pacman -S base-devel git python-pip autoconf libtool pkgconf zlib \
   ncurses cmake libffi openssl jdk17-openjdk
 
+python3 -m venv .venv
+source .venv/bin/activate   # or: .venv/bin/activate.fish
 pip install buildozer cython
 buildozer android debug
 ```
@@ -191,7 +193,7 @@ The Canvas viewer renders screen share as JPEG in a browser with system audio pl
 
 ```bash
 # Start with viewer
-python client/main.py --user alice --room demo --screen --viewer
+python client/main.py --gui --viewer
 
 # Or open viewer later
 /viewer
@@ -208,15 +210,15 @@ The viewer captures system audio (what plays through your speakers) from the sha
 
 ```
 ┌────────────┐   ciphertext    ┌─────────────┐   ciphertext    ┌────────────┐
-│  Client A  │ ───────────────►│ Blind relay │───────────────►│  Client B  │
-│            │◄─────────────── │  (no keys)  │◄───────────────│            │
+│  Client A  │ ───────────────►│ Blind relay │───────────────► │  Client B  │
+│            │◄─────────────── │  (no keys)  │◄─────────────── │            │
 └─────┬──────┘                 └─────────────┘                 └─────┬──────┘
       │                                                              │
       ├─ X25519 identity + ephemeral (triple-DH style)               │
       ├─ HKDF-SHA256 → directional ChaCha20-Poly1305                 │
       ├─ Chat: JSON text                                             │
-      ├─ Voice: ADPCM/ima-v1 frames (20 ms, 16 kHz)                │
-      ├─ Video: ASCIILINE/1.0 frames                               │
+      ├─ Voice: ADPCM/ima-v1 frames (20 ms, 16 kHz)                  │
+      ├─ Video: ASCIILINE/1.0 frames                                 │
       ├─ Image: WebP + ASCII preview                                 │
       ├─ File: raw bytes + metadata                                  │
       └─ Control: key exchange, media presence, peer info            │
@@ -306,17 +308,11 @@ This captures everything playing through the speakers (browser audio, videos, mu
 
 ### Image sharing
 
-Images are converted to WebP on send (quality 80) to save bandwidth. A small ASCII preview is included in the payload so receivers can display it without decoding the full image. Images are stored in memory only — use `/download <id>` to save to disk. Received files are saved to `~/Pictures/asciline/` on Linux or `%LOCALAPPDATA%\asciline\images` on Windows.
+Images are converted to WebP on send (quality 80) to save bandwidth. A small ASCII preview is included in the payload so receivers can display it without decoding the full image. Images are stored in memory only Saved files are saved to `~/Pictures/asciline/` on Linux or `%LOCALAPPDATA%\asciline\images` on Windows.
 
 ### File sharing
 
 Send any file up to 1 MiB with `/sendfile <path>`. Files are E2E encrypted like all other traffic. Metadata (name, MIME type, size, SHA-256) is visible to receivers before download. Use `/files` to list and `/download <id>` to save.
-
-## Tests
-
-```bash
-.venv/bin/python tests/test_codecs_crypto.py
-```
 
 ## Layout
 
