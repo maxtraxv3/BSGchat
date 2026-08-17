@@ -1,0 +1,427 @@
+name: Release
+
+# Builds and publishes:
+#   Android  — arm64 debug APK (Buildozer)
+#   Linux    — x86_64 binaries + GUI AppImage (PyInstaller)
+#   Windows  — x64 .exe for client + relay (PyInstaller)
+#   macOS    — .app (zipped) for Apple Silicon and Intel, plus relay binaries
+#
+# Trigger: push a version tag, or run manually.
+#   git tag v0.3.1 && git push --tags
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  RELAY_PYI: >-
+    --hidden-import shared
+    --hidden-import shared.protocol
+    --hidden-import shared.crypto
+    --hidden-import shared.upnp
+    --hidden-import miniupnpc
+    --exclude-module tkinter
+    --exclude-module PIL
+    --exclude-module cv2
+    --exclude-module numpy
+    --exclude-module sounddevice
+    --exclude-module mss
+  CLIENT_PYI: >-
+    --hidden-import client
+    --hidden-import client.gui
+    --hidden-import client.main
+    --hidden-import client.audio_io
+    --hidden-import client.video_io
+    --hidden-import client.screencap
+    --hidden-import client.web_viewer
+    --hidden-import shared
+    --hidden-import shared.protocol
+    --hidden-import shared.crypto
+    --hidden-import shared.asciline
+    --hidden-import shared.adpcm
+    --hidden-import shared.image_share
+    --hidden-import shared.file_share
+    --hidden-import shared.upnp
+    --hidden-import miniupnpc
+    --hidden-import sounddevice
+    --hidden-import numpy
+    --hidden-import cv2
+    --hidden-import PIL
+    --hidden-import mss
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - id: meta
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+  android:
+    name: Android APK
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential git python3-pip autoconf libtool pkg-config \
+            zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 \
+            cmake libffi-dev libssl-dev automake zip unzip openjdk-17-jdk
+
+      - name: Cache Buildozer
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer
+            .buildozer
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            buildozer-${{ runner.os }}-
+
+      - name: Install Buildozer
+        run: pip install buildozer cython
+
+      - name: Build debug APK
+        run: buildozer android debug
+        env:
+          DISPLAY: ":99"
+
+      - name: Stage APK
+        run: |
+          mkdir -p staged
+          apk="$(ls -1 bin/*.apk | head -n1)"
+          dest="staged/asciline-${{ needs.version.outputs.version }}-android-arm64-debug.apk"
+          cp "$apk" "$dest"
+          ls -lh staged
+          echo "### Android" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$(basename "$dest")\` ($(du -h "$dest" | cut -f1))" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: staged/*.apk
+          if-no-files-found: error
+
+  windows:
+    name: Windows .exe
+    needs: version
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements.txt
+
+      - name: Build relay
+        run: |
+          # shellcheck disable=SC2086
+          pyinstaller --clean --noconfirm --onefile \
+            --name asciline-relay --console \
+            ${{ env.RELAY_PYI }} \
+            server/relay.py
+
+      - name: Build GUI client
+        run: |
+          # shellcheck disable=SC2086
+          pyinstaller --clean --noconfirm --onefile \
+            --name asciline-client --windowed \
+            ${{ env.CLIENT_PYI }} \
+            client/main.py
+
+      - name: Stage executables
+        run: |
+          mkdir -p staged
+          mv dist/asciline-relay.exe \
+            "staged/asciline-relay-${{ needs.version.outputs.version }}-windows-x64.exe"
+          mv dist/asciline-client.exe \
+            "staged/asciline-client-${{ needs.version.outputs.version }}-windows-x64.exe"
+          ls -lh staged
+          echo "### Windows" >> "$GITHUB_STEP_SUMMARY"
+          ls -lh staged | awk 'NR>1 {print "- `" $9 "` (" $5 ")"}' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: staged/*.exe
+          if-no-files-found: error
+
+  linux:
+    name: Linux binary + AppImage
+    needs: version
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3-tk python3-dev \
+            libportaudio2 portaudio19-dev libasound2-dev \
+            libgl1 libglib2.0-0 libxcb1 libxkbcommon0 \
+            patchelf wget file
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements.txt
+          python -c "import tkinter; print('tk', tkinter.TkVersion)"
+
+      - name: Build onefile binaries
+        run: |
+          # shellcheck disable=SC2086
+          pyinstaller --clean --noconfirm --onefile \
+            --name asciline-relay --console \
+            --distpath dist/bin \
+            ${{ env.RELAY_PYI }} \
+            server/relay.py
+          # shellcheck disable=SC2086
+          pyinstaller --noconfirm --onefile \
+            --name asciline-client --windowed \
+            --distpath dist/bin \
+            ${{ env.CLIENT_PYI }} \
+            client/main.py
+
+      - name: Build onedir client for AppImage
+        run: |
+          # shellcheck disable=SC2086
+          pyinstaller --noconfirm --onedir \
+            --name asciline-client --windowed \
+            --distpath dist/onedir \
+            ${{ env.CLIENT_PYI }} \
+            client/main.py
+
+      - name: Package AppImage
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.version.outputs.version }}"
+
+          python - <<'PY'
+          from PIL import Image, ImageDraw
+          img = Image.new("RGBA", (256, 256), (30, 30, 32, 255))
+          d = ImageDraw.Draw(img)
+          d.rounded_rectangle((16, 16, 240, 240), radius=40,
+                              fill=(37, 37, 38, 255),
+                              outline=(86, 156, 214, 255), width=8)
+          d.ellipse((78, 64, 178, 164), outline=(106, 153, 85, 255), width=10)
+          d.polygon([(128, 176), (92, 220), (164, 220)], fill=(206, 145, 120, 255))
+          img.save("asciline.png")
+          PY
+
+          rm -rf AppDir
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications \
+                   AppDir/usr/share/icons/hicolor/256x256/apps
+          cp -a dist/onedir/asciline-client/. AppDir/usr/bin/
+          cp asciline.png AppDir/asciline.png
+          cp asciline.png AppDir/usr/share/icons/hicolor/256x256/apps/asciline.png
+
+          cat > AppDir/asciline.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Asciline Chat
+          Comment=End-to-end encrypted chat
+          Exec=asciline-client
+          Icon=asciline
+          Categories=Network;InstantMessaging;Chat;
+          Terminal=false
+          StartupNotify=true
+          EOF
+          cp AppDir/asciline.desktop AppDir/usr/share/applications/asciline.desktop
+
+          cat > AppDir/AppRun <<'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          export PATH="${HERE}/usr/bin:${PATH}"
+          exec "${HERE}/usr/bin/asciline-client" "$@"
+          EOF
+          chmod +x AppDir/AppRun AppDir/usr/bin/asciline-client
+
+          curl -sL -o appimagetool.AppImage \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool.AppImage
+          ./appimagetool.AppImage --appimage-extract
+          ARCH=x86_64 ./squashfs-root/AppRun --no-appstream \
+            AppDir "dist/asciline-client-${VERSION}-linux-x86_64.AppImage"
+          chmod +x "dist/asciline-client-${VERSION}-linux-x86_64.AppImage"
+
+      - name: Stage artifacts
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          mkdir -p staged
+          cp dist/bin/asciline-client "staged/asciline-client-${VERSION}-linux-x86_64"
+          cp dist/bin/asciline-relay  "staged/asciline-relay-${VERSION}-linux-x86_64"
+          cp "dist/asciline-client-${VERSION}-linux-x86_64.AppImage" staged/
+          chmod +x staged/*
+          ls -lh staged
+          echo "### Linux" >> "$GITHUB_STEP_SUMMARY"
+          ls -lh staged | awk 'NR>1 {print "- `" $9 "` (" $5 ")"}' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: staged/*
+          if-no-files-found: error
+
+  macos:
+    name: macOS ${{ matrix.label }}
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            arch: arm64
+            label: Apple Silicon
+          - os: macos-15-intel
+            arch: x86_64
+            label: Intel
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install system dependencies
+        run: brew install portaudio
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements.txt
+          python -c "import tkinter; print('tk', tkinter.TkVersion)"
+          python -c "import platform; print(platform.machine())"
+
+      - name: Build relay binary
+        run: |
+          # shellcheck disable=SC2086
+          pyinstaller --clean --noconfirm --onefile \
+            --name asciline-relay --console \
+            ${{ env.RELAY_PYI }} \
+            server/relay.py
+
+      - name: Build GUI .app
+        run: |
+          # shellcheck disable=SC2086
+          pyinstaller --clean --noconfirm --onefile --windowed \
+            --name asciline-client \
+            --osx-bundle-identifier org.asciline.client \
+            ${{ env.CLIENT_PYI }} \
+            client/main.py
+
+      - name: Add macOS privacy strings and sign
+        run: |
+          set -euo pipefail
+          APP="dist/asciline-client.app"
+          test -d "$APP"
+          PLIST="$APP/Contents/Info.plist"
+
+          add_or_set() {
+            local key="$1" value="$2"
+            if /usr/libexec/PlistBuddy -c "Print :${key}" "$PLIST" >/dev/null 2>&1; then
+              /usr/libexec/PlistBuddy -c "Set :${key} ${value}" "$PLIST"
+            else
+              /usr/libexec/PlistBuddy -c "Add :${key} string ${value}" "$PLIST"
+            fi
+          }
+
+          add_or_set NSCameraUsageDescription \
+            "Asciline uses the camera for ASCII video chat."
+          add_or_set NSMicrophoneUsageDescription \
+            "Asciline uses the microphone for voice chat."
+          add_or_set NSDesktopFolderUsageDescription \
+            "Asciline uses screen recording for screen share."
+          add_or_set CFBundleDisplayName "Asciline Chat"
+          add_or_set CFBundleName "Asciline"
+
+          # Ad-hoc signature so Gatekeeper at least sees a signed bundle.
+          codesign --force --deep --sign - "$APP"
+          codesign --force --sign - dist/asciline-relay
+
+      - name: Stage artifacts
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          ARCH="${{ matrix.arch }}"
+          mkdir -p staged
+          ditto -c -k --keepParent \
+            dist/asciline-client.app \
+            "staged/asciline-client-${VERSION}-macos-${ARCH}.zip"
+          cp dist/asciline-relay "staged/asciline-relay-${VERSION}-macos-${ARCH}"
+          chmod +x "staged/asciline-relay-${VERSION}-macos-${ARCH}"
+          ls -lh staged
+          echo "### macOS ${{ matrix.label }} (${ARCH})" >> "$GITHUB_STEP_SUMMARY"
+          ls -lh staged | awk 'NR>1 {print "- `" $9 "` (" $5 ")"}' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: staged/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [version, android, windows, linux, macos]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List release files
+        run: |
+          find artifacts -type f -exec ls -lh {} \;
+          echo "### Release files" >> "$GITHUB_STEP_SUMMARY"
+          find artifacts -type f -printf '- `%f` (%s bytes)\n' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: Asciline ${{ needs.version.outputs.version }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: artifacts/*
