@@ -27,7 +27,7 @@ requirements =
     pyjnius,
     plyer,
     openssl,
-    cryptography==42.0.5,
+    cryptography,
     cffi,
     charset-normalizer
 
@@ -72,7 +72,7 @@ android.add_src = src
 p4a.branch = develop
 
 # Force pip to respect p4a cross-compilation flags
-p4a.pip_build_options = --no-build-isolation
+p4a.pip_build_options = --no-build-isolation --no-binary charset-normalizer
 
 # Manifest additions required for Foreground Service types on Android 14+ (API 35)
 android.manifest.application_manifest_xml = <service android:name="org.asciline.MediaProjectionService" android:foregroundServiceType="mediaProjection|microphone" android:exported="false" />
