@@ -19,8 +19,8 @@ version = 0.3.0
 # No opencv — Android doesn't need it (camera uses pyjnius Camera1 API,
 # screen uses MediaProjection). numpy is needed for ADPCM voice codec.
 requirements =
-    python3,
-    hostpython3,
+    python3==3.11.9,
+    hostpython3==3.11.9,
     kivy,
     pillow,
     numpy,
@@ -69,7 +69,7 @@ android.add_src = src
 # warn_on_root = 1
 
 # ── P4A (python-for-android) recipes ───────────────────────────────
-p4a.branch = develop
+p4a.branch = master
 
 # Force pip to respect p4a cross-compilation flags
 p4a.pip_build_options = --no-build-isolation --no-binary charset-normalizer
