@@ -18,15 +18,19 @@ version = 0.3.0
 # ── Requirements ────────────────────────────────────────────────────
 # No opencv — Android doesn't need it (camera uses pyjnius Camera1 API,
 # screen uses MediaProjection). numpy is needed for ADPCM voice codec.
+# ── Requirements ────────────────────────────────────────────────────
 requirements =
     python3,
+    hostpython3,
     kivy,
     pillow,
     numpy,
     pyjnius,
     plyer,
     openssl,
-    cryptography
+    cryptography==42.0.5,
+    cffi,
+    charset-normalizer
 
 # ── Android-specific ────────────────────────────────────────────────
 android.permissions =
@@ -67,3 +71,9 @@ android.add_src = src
 
 # ── P4A (python-for-android) recipes ───────────────────────────────
 p4a.branch = develop
+
+# Force pip to respect p4a cross-compilation flags
+p4a.pip_build_options = --no-build-isolation
+
+# Manifest additions required for Foreground Service types on Android 14+ (API 35)
+android.manifest.application_manifest_xml = <service android:name="org.asciline.MediaProjectionService" android:foregroundServiceType="mediaProjection|microphone" android:exported="false" />
