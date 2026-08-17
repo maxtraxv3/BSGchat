@@ -18,7 +18,6 @@ version = 0.3.0
 # ── Requirements ────────────────────────────────────────────────────
 # No opencv — Android doesn't need it (camera uses pyjnius Camera1 API,
 # screen uses MediaProjection). numpy is needed for ADPCM voice codec.
-# ── Requirements ────────────────────────────────────────────────────
 requirements =
     python3,
     hostpython3,
