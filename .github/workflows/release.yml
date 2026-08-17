@@ -60,7 +60,7 @@ env:
 
 jobs:
   version:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       version: ${{ steps.meta.outputs.version }}
     steps:
@@ -75,7 +75,7 @@ jobs:
   android:
     name: Android APK
     needs: version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
